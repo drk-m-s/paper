@@ -8,7 +8,7 @@ The NPU has 56 TOPS INT8 AI compute, 10GB of high-bandwidth 3D-stacked DRAM buil
 The final product will be a m.2 2280 card containing a single NPU chip. The m.2 card connects to the CPU via 4 lanes of PCIe 4.0 with 8GB/s of bandwidth. The SSD to CPU data bandwidth and DRAM to CPU data bandwidth is not controllable by us, it is determined by the SSD and DRAM used. But as a general reference, consider SSD to CPU having 8GB/s bandwidth and DRAM to CPU with 68GB/s.
 
 # Use case scenario 
-The m.2 card will be used in Mini-PCs, Mini-Stations, AI NAS products. It will provide offline inference of qwen3.6-35B-A3B or similar sized MoE models. Values to customers include saving API token fees, privacy protection and faster response. Batch size=1.
+The m.2 card will be used in Mini-PCs, Mini-Stations, AI NAS products. It will provide offline inference of qwen3.6-35B-A3B or similar sized MoE models. Values to customers include saving API token fees, privacy protection and faster response.
 
 # Performance requirements
 The MoE offloading engine combined with the NPU chip solution should deliver the following performance with 4-bit quantized 35B model:
