@@ -27,7 +27,7 @@ Conduct a systematic, exhaustive literature survey on a technical topic. Outputs
 ### Phase 1 — Scope Definition
 
 Before searching, load the research context file from the workspace:
-- Read [background.md](../../background.md) to understand the project goal, hardware constraints, performance requirements, and design principles
+- Read [background.md](../background.md) to understand the project goal, hardware constraints, performance requirements, and design principles
 - Extract: target use case, key bottlenecks, relevant model families, and implementation constraints
 - This context will drive importance ranking and the pros/cons analysis
 

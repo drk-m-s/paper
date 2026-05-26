@@ -5,7 +5,7 @@ I am trying to develop an MoE offloading engine based on llama.cpp for an edge N
 The NPU has 56 TOPS INT8 AI compute, 10GB of high-bandwidth 3D-stacked DRAM built-in, with 1200GB/s memory bandwidth. The chip package is 14mmx14mmx1mm, with a typical power of 15W.
 
 # Hardware solution spec
-The final product will be a m.2 2280 card containing a single NPU chip. The m.2 card connects to the CPU via 4 lanes of PCIe 4.0 with 8GB/s of bandwidth. The SSD to CPU data bandwidth and DRAM to CPU data bandwidth is not controllable by us, it is determined by the SSD and DRAM used. But as a general reference, consider SSD to CPU having 8GB/s bandwidth and DRAM to CPU with 68GB/s.
+The final product will be a m.2 2280 card containing a single NPU chip. The m.2 card connects to the CPU via 4 lanes of PCIe 4.0 with 8GB/s of bandwidth. The SSD to CPU data bandwidth and DRAM to CPU data bandwidth is not controllable by us, it is determined by the SSD and DRAM used. But as a general reference, consider SSD to CPU having 8GB/s bandwidth and DRAM to CPU with 68GB/s. Note that the SSD and the NPU does not share the same PCIe port, they are seperated connected to the CPU.
 
 # Use case scenario 
 The m.2 card will be used in Mini-PCs, Mini-Stations, AI NAS products. It will provide offline inference of qwen3.6-35B-A3B or similar sized MoE models. Values to customers include saving API token fees, privacy protection and faster response. Batch size=1.
