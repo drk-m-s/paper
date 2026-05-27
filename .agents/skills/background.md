@@ -24,7 +24,7 @@ The entire hardware + software solution should cover different market needs:
 # MoE offload engine development considerations
 We will need to design our own architecture based on other research papers, but here are some requirements:
 1. It should be implementatable in llama.cpp. Although I think all of the papers can be implemented in llama.cpp.
-2. It shouldn't make modifications to the model. End users should be able to pull models from huggingface and use it directly.
+2. It shouldn't make modifications to the model unless there is huge performance benefits. End users should be able to pull models from huggingface and use it directly.
 3. It can contain an offline profiling phase to identify "hot" vs "cold" experts. But only if this yields significant gains in performance.
 4. It should have an option to only use NPU for compute or use CPU + NPU for hybrid compute. Meaning when paired with a weak CPU in low-price oriented markets, we use NPU for compute, when paried with a strong CPU in performance oriented markets, we leverage CPU + NPU compute.
 5. The final architecture should be easy to understand, easy to implement, clean and lean, with good performance gains.

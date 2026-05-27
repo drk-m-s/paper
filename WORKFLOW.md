@@ -6,4 +6,5 @@ you can ask AI to incorporate md summary results to the excel summary file.
 ## Paper DeepDive
 manually download paper pdf file at /papers.
 use /moe-paper-analysis path/to/paper.pdf to deepdive a specific paper. deepdive aspects are defined in /.agents/skills/moe-paper-analyis/SKILL.md
+manually categorize papers into 2-star to 5-star folder, with 5-star as the most relevant and important category.
 outputs summary result at /paper_analysis/paper-name.md.
