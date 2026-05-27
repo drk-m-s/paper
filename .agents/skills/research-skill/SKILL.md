@@ -107,7 +107,7 @@ Rank each paper **1–5** (5 = most important, 1 = least important) using the fo
 
 | Criterion | Weight | Guidance |
 |---|---|---|
-| **Relevance to project goal** | 40% | How directly does it address constraints in `background.md`? (NPU, llama.cpp, no model modification, PCIe 4.0, 10 GB HBM) |
+| **Relevance to project goal** | 40% | How directly does it address constraints in `background.md`? (single batch, llama.cpp, no model modification, PCIe 4.0, 10 GB HBM) |
 | **Technical novelty** | 30% | Does it introduce a genuinely new mechanism vs. incremental tuning? |
 | **Venue prestige** | 20% | SOSP/OSDI/ICLR/NeurIPS = top tier; arXiv-only = lower; workshop = lowest |
 | **Citation impact** | 10% | >100 citations = significant; >30 = notable; <5 = emerging |
@@ -123,7 +123,7 @@ For each paper, write 2–4 bullet pros and 2–4 bullet cons **specifically wit
 
 ### Phase 7 — Output: Per-Paper Detail Report
 
-Write a markdown file named `deep-research-report-<date>.md` (e.g. `deep-research-report-2026-05.md`) in the `papers/` folder.
+Write a markdown file named `deep-research-report-<date>.md` (e.g. `deep-research-report-2026-05-15.md`) in the `paper_analysis/summary` folder.
 
 Structure:
 ```markdown
@@ -189,7 +189,7 @@ Before finishing, verify:
 
 | File | Location | Contents |
 |---|---|---|
-| `deep-research-report-YYYY-MM.md` | `papers/` | Per-paper details with pros/cons |
-| `deep-research-list-papers-YYYY-MM.md` | `papers/` | Categorized tables + full flat list |
+| `deep-research-report-YYYY-MM-DD.md` | `paper_analysis/summary` | Per-paper details with pros/cons |
+| `deep-research-list-papers-YYYY-MM-DD.md` | `paper_analysis/summary` | Categorized tables + full flat list |
 
 Both files should be self-contained and readable without cross-referencing each other.
