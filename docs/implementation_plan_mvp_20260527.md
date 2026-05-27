@@ -307,7 +307,7 @@ Output: same llama-bench-style summary as §4.7(B) per run, plus an aggregated t
 ## 5. Repository layout (overlay on upstream llama.cpp fork)
 
 ```
-llama.cpp/                       (fork root)
+llama.cpp.offload/                       (fork root)
 ├── CMakeLists.txt               <-- adds option(LLAMA_MOE_OFFLOAD)
 ├── src/
 │   ├── llama.cpp                <-- ≤ 10 lines of hook callouts, all #ifdef'd
