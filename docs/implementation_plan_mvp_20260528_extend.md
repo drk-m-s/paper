@@ -29,6 +29,14 @@ Verification after this fix:
   smoke run.
 - `moe-profile-test.csv` remains nonempty with header plus per-layer rows.
 
+Second follow-up: the desired §4.7 formatter now lives in
+`src/moe-offload/profiler.cpp` as `llama_moe::format_summary(...)`, so the
+profiler source contains the planned output format. `llama-moe-bench` now uses
+that formatter and checkpoints `--moe-profile-summary` after prefill and after
+each completed repeat, instead of only writing it at process exit. This makes
+`moe-summary.txt` visible during long `--pp 1024 --tg 256 --repeat 3` runs while
+the CSV is still being streamed.
+
 ### What changed
 
 - `tools/moe-bench/main.cpp` now always enables MoE offload (`model_params.moe_offload = true`), passes cache/predictor/profile paths into model loading, supports both `--flag value` and `--flag=value`, and renders the §4.7-style summary to stdout.
