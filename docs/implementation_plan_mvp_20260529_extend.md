@@ -12,12 +12,16 @@ each session. One phase per session.
 - G — DONE (2026-05-28)
 - H — DONE (2026-05-28) — eval-callback rewired to async H2D; double-read
   deleted
-- **I — DONE (2026-05-28, this session)** — real `compute_us` / `h2d_us`
+- I — DONE (2026-05-28) — real `compute_us` / `h2d_us`
   via CUDA timing events; profile rows buffered per batch and flushed at
   `slot_pool_end_request`
-- J — Streaming golden-logits gate
+- **J — DONE (2026-05-28, this session)** — `--logit-dump` + golden-logits
+  harness landed; drift gate measures `max|d|=4.64e-01` at step 3 (above
+  1e-3 tolerance); bug is real, plan §3 speculative fix did not close it,
+  deferred to Phase L
 - K — `tests/moe-offload/` test set
-- L — README truth-up (also: wire `slot_pool_shutdown_io` into runtime
+- L — README truth-up (also: streaming numeric drift; small-cache /
+  multi-token-prompt deadlocks; wire `slot_pool_shutdown_io` into runtime
   teardown — see Phase H deviation below)
 
 ---
@@ -462,13 +466,171 @@ will give a less noisy comparison.
 
 ---
 
-## Next session — Phase J
+## Phase J — DONE (2026-05-28)
 
-Streaming numeric correctness gate. Add `--logit-dump PATH` to
-`llama-completion`, write the
-`tests/moe-offload/test-golden-logits.ps1` harness, and the
-`tests/moe-offload/compare_logits.py` helper. Run at
-`--moe-cache-vram-mb 4000` and full-residency against the Qwen3.5-35B
-model and record `max|Δlogit|` in `docs/moe-offload/README.md`. If the
-tolerance fails, fix via `reset_graph_state()` audit per source plan §3
-Phase J.
+Goal: Streaming numeric correctness gate. Add `--logit-dump PATH` to
+`llama-completion`, write the harness + comparator, run them against
+full residency and a streaming cache, record `max|Δlogit|`.
+
+### Files modified
+
+- `common/common.h` — new `logit_dump_path` field on `common_params`.
+- `common/arg.cpp` — registers `--logit-dump PATH` (placed after
+  `--moe-oracle`, gated outside the MoE `#ifdef` since it is a generic
+  diagnostic).
+- `tools/completion/completion.cpp` —
+  - Opens `logit_dump_path` with a 16-byte header
+    (`"LLMLOGV1"` magic + `int32 n_vocab` + `int32 reserved=0`) once at
+    startup; logs `path` and `n_vocab` via `LOG_INF`.
+  - In the per-decode sample branch (`embd_inp.size() <= n_consumed
+    && !is_interacting`), writes `n_vocab` floats from
+    `llama_get_logits_ith(ctx, -1)` *before* `common_sampler_sample`,
+    then `fflush` so the file size reflects decode progress for
+    on-the-fly monitoring.
+  - Flushes + closes the file before `llama_backend_free`.
+- `src/llama-context.cpp` — `graph_reserve()` now also calls
+  `llama_moe::reset_graph_state()` after `ggml_backend_sched_reset()`,
+  matching the pattern already present on the rebuild branch of
+  `process_ubatch()`. (Speculative fix from source plan §3 Phase J —
+  see "Findings" below.)
+- `tests/moe-offload/compare_logits.py` — NEW. Validates magic,
+  reshapes payload to `(n_steps, n_vocab)`, prints `max|d|` /
+  `mean|d|`, exits 1 if `max|d| >= --tol`.
+- `tests/moe-offload/test-golden-logits.ps1` — NEW. Two
+  `llama-completion` runs (full residency vs. streaming) with
+  per-decode logit dumps, then `compare_logits.py`. Uses
+  `Start-Process -RedirectStandardOutput/Error` to avoid PowerShell's
+  `NativeCommandError` on stderr writes. Pre-quotes multi-word args
+  inside the `-ArgumentList` array because PS does not auto-quote.
+- `tests/moe-offload/README.md` — NEW. Documents harness usage,
+  prereqs (Python + numpy), binary dump format, exit codes, and
+  why this is not registered with CTest.
+- `docs/moe-offload/README.md` — NEW "Correctness" section with the
+  measured numbers and deviation notes.
+
+### Build verification
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-moe --config Release --target llama-completion
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-vanilla-check --config Release --target llama
+```
+
+Both succeed. `--logit-dump` appears in `llama-completion --help`.
+
+### Functional smoke
+
+Model: `C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`
+(n_layers=40, n_experts_per_layer=256, top-k=8, n_vocab=248320).
+
+| Run | `--moe-cache-vram-mb` | Wall | Notes |
+|---|---|---|---|
+| Full residency | 99999 | 7.34 s / 8 runs | dump = 16 + 8×248320×4 = 7,946,256 B |
+| Streaming | 12000 | ~22 s / 8 runs | n_slots=145; hits=630 misses=970; dump same size |
+
+`compare_logits.py logits-full.bin logits-stream.bin --tol 1e-3`:
+
+```
+n_steps  = 8
+n_vocab  = 248320
+max|d|   = 4.639292e-01
+mean|d|  = 3.669774e-02
+tol      = 1.000000e-03
+FAIL: max|d| at step 3
+```
+
+### Findings
+
+- The gate works: the harness produces a clean, reproducible drift
+  measurement and exits non-zero when it exceeds tolerance.
+- The drift itself is **real**. The source plan §3 Phase J
+  contingency (add `reset_graph_state()` on rebuild paths) was tried
+  by hooking it into `graph_reserve()`; the measured `max|d|` did not
+  move (identical to the pre-fix run, byte-for-byte). The
+  `process_ubatch()` rebuild branch already had the call. Conclusion:
+  the drift is not caused by stale topk→slot_table registrations
+  alone.
+- Top-1 tokens at temp=0 still match full residency for the first 8
+  decodes (Phase H/I text-equivalence smoke confirms this), so the
+  drift is small enough to leave argmax invariant in this prompt but
+  is well above 1e-3 in the full softmax row.
+- Remaining suspects (deferred to Phase L / post-MVP hygiene):
+  a slot whose contents are replaced between the callback's H2D
+  completion and the consuming mul_mat_id, or a callback-vs-scheduler
+  ordering issue where a later layer's callback writes a
+  slot_table entry before the previous layer's compute reads it.
+
+### Deviations from source plan §3
+
+- **Cache size 4000 → 12000 MiB.** At 4000 MiB the slot pool deadlocks
+  before generation starts (n_slots ≈ 48 < n_ubatch × top-k = 64). 8000
+  MiB hangs similarly under load. 12000 MiB is the smallest size that
+  reliably completes here while still forcing heavy eviction
+  (hits 630 / misses 970). The hang at smaller caches reproduces
+  without `--logit-dump`, so it is a pre-existing slot-pool issue —
+  filed against Phase L.
+- **Prompt `"The quick brown fox"` → `"Hello"`.** With the harness
+  binary, any prompt of more than ~2 tokens hangs the streaming run
+  during prefill (no log output past `generate: n_predict=N`). This
+  reproduces without `--logit-dump` and is independent of cache size
+  ≥ 12000. Filed against Phase L. `"Hello"` still exercises the
+  streaming path end-to-end (200 topk callbacks, 970 misses).
+- **`n_predict 32 → 8`.** Required to get a streaming run that
+  completes inside the prompt-length / cache constraints above.
+
+### PowerShell harness quirks worth documenting
+
+- `& $exe @argArray *>&1 | Tee-Object` trips
+  `NativeCommandError` on every stderr write. Use
+  `Start-Process -RedirectStandardError`.
+- `Start-Process -ArgumentList @("a","b c","d")` passes
+  `a b c d` as 4 args, not 3. Pre-quote multi-word elements
+  (``"`"$Prompt`""``) inside the array.
+- Exit code `-1073740791` (`STATUS_STACK_BUFFER_OVERRUN`) on the
+  streaming run still appears at shutdown only (pre-existing per
+  Phase H notes). The dump file is fully flushed and closed before
+  the path that crashes runs, so it is harmless for this gate.
+
+### Acceptance checklist
+
+- [x] J.1 `--logit-dump PATH` registered on `common_params` and
+      hooked into `llama-completion` (header + per-decode rows +
+      close-on-exit).
+- [x] J.2 `tests/moe-offload/compare_logits.py` prints
+      `n_steps`, `n_vocab`, `max|d|`, `mean|d|`, `tol`; exits
+      non-zero on drift.
+- [x] J.3 `tests/moe-offload/test-golden-logits.ps1` drives two
+      runs and the comparator end-to-end.
+- [x] J.4 Speculative fix from source plan §3 (extra
+      `reset_graph_state()` on `graph_reserve`) landed. Did not
+      close the drift; documented above.
+- [x] J.5 `docs/moe-offload/README.md` gains a "Correctness"
+      section with the measured `max|d|` and deviation notes.
+- [x] J.6 this extend.md updated.
+- [ ] J — Acceptance criterion `max|Δlogit| < 1e-3`. **Not met.**
+      Drift is reproducibly 4.64e-01 at step 3. Bug is real and
+      tracked; harness is the gate that surfaced it.
+
+### Decisions captured
+
+- The Phase J gate is now usable as a regression check even though
+  the current measurement does not pass `--tol 1e-3`. Future fixes
+  to the streaming path can be evaluated by re-running
+  `test-golden-logits.ps1` and watching `max|d|` shrink.
+- The `--logit-dump` flag is intentionally a generic float32 dump
+  (not gated on `LLAMA_MOE_OFFLOAD`); it is useful for any
+  numerical-equivalence comparison and costs nothing when unused.
+- Cache-size and prompt-length deadlocks are not Phase J's
+  responsibility to fix — they are pre-existing Phase L hygiene
+  items now explicitly listed.
+
+---
+
+## Next session — Phase K
+
+Minimal `tests/moe-offload/` test set per source plan §3. Add the
+three small C++ unit tests (`test-eamc-cosine.cpp`,
+`test-lru-eviction.cpp`, `test-manifest-roundtrip.cpp`) under a
+`LLAMA_MOE_OFFLOAD`-gated `tests/moe-offload/CMakeLists.txt`, registered
+with CTest. These are dev-box only and do not require the multi-GB
+model. Confirm they pass under the existing `build-moe` build before
+closing the phase.
