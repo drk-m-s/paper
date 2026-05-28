@@ -847,3 +847,161 @@ hygiene items accumulated across H/I/J:
 - update `docs/moe-offload/README.md` with the Phase H/I/J/K
   measured numbers and the new test surface.
 
+---
+
+## Phase L — DONE (2026-05-28)
+
+Closeout of the hygiene items left by Phases H/I/J plus the README
+truth-up.
+
+### Files modified
+
+- `src/llama-context.cpp` — destructor now calls
+  `slot_pool_shutdown_io()` at the top (gated on `LLAMA_MOE_OFFLOAD`
+  and `runtime_enabled()`) before any backend buffer / sched
+  teardown, so the IO worker thread is joined while the CUDA events
+  and pinned host buffers it references are still alive. Comment
+  explains the ordering invariant.
+- `src/moe-offload/slot_pool.cpp`
+  - `slot_pool_init_io()`: bumped the IO pinned-buffer pool from
+    `clamp(2*n_slots_per_layer, 8, 64)` to
+    `clamp(2*n_slots_per_layer, kMinIoBuffers=192, kMaxIoBuffers=256)`.
+    Floor derivation: worst-case per-layer demand is
+    `kMaxStreamingUbatch=8 × top_k_max=8 × EXPERT_KIND_COUNT=3 = 192`
+    in-flight buffer reservations between submit and worker-side
+    consumption. Pinned-host cost at 256 × ~720 KB ≈ 184 MB, well
+    under the host budget.
+  - `moe_eval_callback()` miss loop: introduced a
+    `std::unordered_set<int32_t> reserved_this_call;` tracking the
+    experts already reserved during this single callback invocation.
+    LRU-victim search and the `lc.lru.rbegin()` fallback now both
+    skip experts in that set; if no valid victim remains, the path
+    emits `LLAMA_LOG_ERROR` and aborts with
+    `GGML_ABORT("MoE-offload: slot pool exhausted by in-flight reservations")`.
+    `reserved_this_call.insert(e)` runs after a successful slot
+    reservation. This closes the prior bug where the predictor
+    happily picked a just-reserved expert as its eviction victim
+    and re-targeted concurrent H2D writes at the same slot.
+- `docs/moe-offload/README.md` — Phase L truth-up:
+  - `compute_us` and `h2d_us` semantics rewritten to match the
+    Phase I CUDA-event timing path; `stall_us` documented as the
+    host-measured drain wall (Phase H).
+  - "Current state" extended with phases H/I/J/K/L bullets.
+  - Deviations block rewritten: cache=4000 and multi-token-prompt
+    now run cleanly; Phase J drift number stays as last-good
+    measurement; full-residency `prefetch_all_experts`
+    `GGML_ASSERT(buf != NULL …)` documented as pre-existing
+    regression that blocks harness re-run.
+  - New "Test surface" section listing the four CTest entries
+    under label `moe-offload` plus the dev-box PowerShell harness
+    and `compare_logits.py`, with a link to
+    `tests/moe-offload/README.md`.
+- `docs/moe-offload/known-issues.md` — **NEW**. Consolidates open
+  items (drift, full-residency assert, ubatch≤8 cap, EAMC sidecar
+  persistence), deferred §6 items (oracle mode, direct I/O,
+  multi-GPU, CPU/KV tiers, learned predictors), and lists the
+  issues this phase closed.
+
+### Deviations from the L plan
+
+- **L.3 (streaming drift root-cause)** was not attempted. The Phase
+  J logit harness needs a full-residency reference dump to
+  regenerate the comparison; on the current HEAD,
+  `prefetch_all_experts` aborts with
+  `GGML_ASSERT(buf != NULL && "tensor buffer not set")` inside
+  `ggml_backend_tensor_set` (the dummy-byte H2D sync after
+  zeroing 75 slot tensors). Reproduced both with the Phase L edits
+  and on a clean `git stash` baseline (same HEAD without L), so
+  the regression is pre-existing relative to Phase L, not caused
+  by L. It is logged in `docs/moe-offload/known-issues.md` and
+  escalated to post-MVP. The Phase J drift number
+  (`max|Δlogit|=4.64e-01`) stays in the README as the last good
+  measurement.
+
+### Build verification
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-moe `
+    --config Release --target llama llama-completion
+```
+
+Builds clean. Vanilla check tree:
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-vanilla-check `
+    --config Release --target llama
+```
+
+Also builds clean (no shared-source changes regressed the
+non-MoE path).
+
+### Functional smoke
+
+Model: `C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`.
+
+| Scenario | Pre-L behaviour | Post-L behaviour |
+|---|---|---|
+| `--moe-cache-vram-mb 12000 -p "Hello" -n 8 --temp 0 --seed 42` | Runs, but exit returns `-1073740791` (`STATUS_STACK_BUFFER_OVERRUN`). | Runs and exits cleanly (worker joined in destructor). |
+| `--moe-cache-vram-mb 4000 -p "Hello" -n 4` | Hangs before generation (buffer-pool starvation). | Completes in 3.36 s. |
+| `--moe-cache-vram-mb 12000 -p "The quick brown fox" -n 4` | Hangs during prefill (same starvation, multi-token path). | Prefill 2474.67 ms / 4 tokens; decode 519.16 ms / 3 tokens. |
+| Full-residency (`--moe-cache-vram-mb 99999`) | Crashes with `GGML_ASSERT(buf != NULL …)` after `prefetch_all_experts: zeroed 75 slot tensors`. | Same crash — pre-existing regression on HEAD, **not** introduced by Phase L (confirmed via `git stash` baseline). Documented in `known-issues.md`. |
+
+### CTest verification
+
+`ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure`:
+
+```
+1/4 Test #43: test-cuda-stream .................   Passed    0.28 sec
+2/4 Test #44: test-eamc-cosine .................   Passed    0.05 sec
+3/4 Test #45: test-lru-eviction ................   Passed    0.02 sec
+4/4 Test #46: test-manifest-roundtrip ..........   Passed    0.02 sec
+100% tests passed, 0 tests failed out of 4
+```
+
+### Status checklist
+
+- [x] L.1 `slot_pool_shutdown_io` wired into
+      `llama_context::~llama_context()`; clean exit code on shutdown.
+- [x] L.2 Small-cache (`≤ 8000 MiB`) deadlock and multi-token-prompt
+      hang fixed via IO buffer-pool floor and miss-loop
+      reserved-victim guard.
+- [~] L.3 Streaming logit drift root-cause **deferred** — Phase J
+      harness blocked by a pre-existing full-residency
+      `GGML_ASSERT(buf != NULL)` regression on the current HEAD.
+      Documented in `docs/moe-offload/known-issues.md`.
+- [x] L.4 `docs/moe-offload/README.md` updated; new
+      `docs/moe-offload/known-issues.md` created.
+- [x] L.5 This extend.md updated.
+
+### Decisions captured
+
+- Pinned-buffer pool floor is sized from worst-case per-layer
+  demand (`n_ubatch × top_k × EXPERT_KIND_COUNT = 192`), not from
+  `n_slots_per_layer`. The previous formula made cache size a
+  silent dependency of IO pool size, which is what caused the
+  small-cache deadlock.
+- Reserved-this-call exclusion lives entirely inside the miss
+  loop; no predictor API change. Hard-abort (rather than spin) on
+  exhaustion because by construction `n_slots ≥ uniq.size()` is
+  enforced earlier in the callback, so reaching the abort means
+  an invariant has already been broken upstream and silently
+  spinning would mask it.
+- Pre-existing `prefetch_all_experts` crash is escalated to
+  `known-issues.md` rather than worked around in Phase L. The
+  destructor fix (L.1) and the miss-loop fixes (L.2) do not
+  depend on full-residency being healthy.
+
+### Next session
+
+Post-MVP cleanup, candidates in priority order:
+
+1. Root-cause the `prefetch_all_experts` `GGML_ASSERT(buf != NULL)`
+   regression so the Phase J logit harness can be re-run.
+2. With (1) unblocked, drive `max|Δlogit|` below `1e-3` per the
+   Phase J hypotheses (slot-eviction-vs-`mul_mat_id` ordering;
+   late-layer callback racing earlier layers' slot_table reads).
+3. Source plan §6 deferred items as backlog: EAMC sidecar
+   persistence, oracle mode, direct I/O, multi-GPU, CPU/KV tiers,
+   learned predictors.
+
+
