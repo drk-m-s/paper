@@ -413,3 +413,204 @@ Verification:
 2. ggml-cuda doesn''t currently expose its compute stream. We will add a guarded `ggml_backend_cuda_get_stream(ggml_backend_t)` accessor used only by the offload module — small surface change in `ggml-cuda.cu`.
 3. Windows direct-I/O requires sector-aligned offsets, sizes, AND host pointers. Repacker already 4 KiB-aligns offsets; size and pinned buffer alignment must match `dwBytesPerSector` from `GetDiskFreeSpaceW`. Allocate pinned buffers as `expert_blob_size_max` rounded up to 4 KiB.
 4. Eval-callback runs on the compute thread. Long blocking on SSD reads stalls compute. Mitigation: I/O worker thread + cudaStreamWaitEvent so the callback returns immediately after enqueueing wait-on-event; SSD reads overlap with prior-layer GPU compute already on the wire.
+
+
+# Plan: MoE Offload MVP — Finish D, then E + F
+
+## TL;DR
+Phases A+B+C are GREEN. Phase D-1 (graph remap + per-build slot_table registration) lands; Phase D-2 (streaming eval-callback) is implemented but crashes in `mmq.cu:206` when per-batch `n_uniq` is high (96) even though `n_uniq <= n_slots`. Finish D by instrumenting first, fixing the crash, swapping the in-callback sync `fread`+`tensor_set` for the planned async I/O pipeline (worker thread + pinned staging + `moe_h2d_stream` + `cudaStreamWaitEvent`), then wire profiler/CSV/summary and the EAMC predictor, then finalize `llama-moe-bench` + docs.
+
+## Phase D — finish streaming (blocking)
+
+### D-3 (debug): isolate the mmq.cu:206 crash
+1. In src/moe-offload/slot_pool.cpp `load_expert_into_slot`, drop the `dump<6` gate; emit one log line per load with `L,e,k,slot, rec.size, stride, tensor_off, write_off, buf_name=ggml_backend_buffer_name(slot_tensor->buffer)`. Cap at ~3000 lines via a global counter.
+2. In `moe_eval_callback`, after writing slot_table, GPU-read it back for **every** layer (not only logical==0 && topk_calls==0), compare to host buffer, log mismatches and the first 8 slot indices.
+3. Run `llama-cli --moe-offload --moe-cache-vram-mb 12000` on the .moe.gguf with the standard golden prompt. Read the trace; verify (a) every slot_tensor buffer is `CUDA0` (not split/CPU), (b) `tensor_off + write_off + rec.size <= buf_size` holds for every load, (c) slot_table readback equals what was written for every layer, (d) all slot indices written are `< n_slots`.
+4. If all 4 hold → the crash is NOT in our load/write path; suspect graph-side. Inspect with `CUDA_LAUNCH_BLOCKING=1` + `compute-sanitizer --tool memcheck --print-limit 50` to capture the OOB address, then compare to the slot tensor base/extent for the failing layer.
+5. Most likely root cause to verify: the slot_table tensor needs `ggml_set_input` removed (already done per code review) AND it must NOT be subject to graph-reuse aliasing across builds. Confirm by adding a unique-name suffix per build counter so the scheduler can never alias a stale tensor pointer.
+
+### D-4 (fix): correct the root cause
+6. Apply the minimal fix from D-3 (one of: load-offset bug, slot_table aliasing, or graph-reuse). Add a one-line assertion in `moe_eval_callback` that `lc.exp2slot[e] < s.n_slots` before writing slot_table. Re-run golden test at `--moe-cache-vram-mb 12000`; assert first-32 tokens match Phase C output.
+7. Stress: rerun at `--moe-cache-vram-mb 4000` (forces frequent eviction). First-32 tokens must still match. 1k-prefill / 256-decode run must not crash.
+
+### D-5 (async I/O pipeline) — per user choice "full async"
+8. Create new src/moe-offload/io.{h,cpp}:
+   - One `std::thread` I/O worker; SPSC ring queue of `io_request { layer, expert, kind, slot, pinned_buf, ev_done }`.
+   - Pinned host staging pool: ring of N buffers, each `expert_blob_size_max` rounded up to 4 KiB, allocated via `cudaHostAlloc(cudaHostAllocDefault)`. Size N = max(2 * n_slots, 64) so the callback can issue an entire layer's misses before blocking.
+   - One CUDA `moe_h2d_stream` (per device), created lazily by querying device id from a slot_tensor's buffer.
+   - Worker loop: pop request → `fread` from buffered FILE* (Phase F may upgrade to `ReadFile(FILE_FLAG_NO_BUFFERING|OVERLAPPED)`; not required now) → `cudaMemcpyAsync(slot.data + slot_idx*stride, pinned, size, H2D, moe_h2d_stream)` → `cudaEventRecord(ev_done, moe_h2d_stream)` → push back to a free-list.
+9. Expose `ggml_backend_cuda_get_stream(ggml_backend_t)` in ggml/src/ggml-cuda/ggml-cuda.cu under `#ifdef LLAMA_MOE_OFFLOAD` (or unconditional accessor — minimal, additive). Plumb that backend handle from `llama_context` into `moe_h2d` init.
+10. Rewrite `moe_eval_callback` miss-path: enqueue 3 I/O requests per missed expert (gate/up/down), keep their `ev_done` handles in `layer_cache::pending_evs`. After the slot_table write, `cudaStreamWaitEvent(compute_stream, ev, 0)` for each pending event, then clear `pending_evs`. (Compute stream is queried via the new accessor.)
+11. Initial residency (Phase C path) still uses the simpler buffered loader so startup behavior is unchanged.
+
+### D verification
+- `--moe-cache-vram-mb 99999` (full residency, streaming OFF) matches vanilla logits within 1e-3 (Phase C gate already verified).
+- `--moe-cache-vram-mb 12000` and `--moe-cache-vram-mb 4000` (streaming) match Phase C output exactly on the golden prompt (greedy argmax).
+- A/B at `--moe-cache-vram-mb 4000` with sync I/O (toggle via env var `MOE_OFFLOAD_SYNC_IO=1`) vs async produces identical logits.
+- No CUDA error / OOB through 1k prefill + 256 decode at `--moe-cache-vram-mb 4000`.
+
+## Phase E — Profiler rows + summary + EAMC wiring
+
+### E-1: profiler
+12. Per-layer event timing in `moe_eval_callback`:
+    - Record CPU-time deltas around the synchronous `fread` (ssd_read_us) and around the eval-callback enqueue (h2d_us_async, end → cudaEventSynchronize before write_off bookkeeping; for fully-async D-5, use `cudaEventElapsedTime` between submit-event and done-event recorded by the I/O worker).
+    - For compute_us: record `cudaEventRecord` on `compute_stream` just before returning from the callback (start) and on the topk node of the NEXT layer (end). Approximation: aggregate per-token via a per-layer running deltas.
+12b. In src/moe-offload/profiler.cpp wire `record_layer(token_idx, phase, il, stats)` exposed via a new `record_layer` API; called from `moe_eval_callback`. Stats include: `k_required, k_hit, k_miss, ssd_read_us, h2d_us, compute_us, stall_us, cache_resident_experts, predictor`.
+13. Open CSV at first record_layer using `runtime_options::profile_csv` path; emit header per plan §4.7(A). Flush per row to survive crashes during early testing.
+
+### E-2: summary
+14. In src/moe-offload/runtime.cpp::end_request, aggregate counters from slot_pool + profiler into the §4.7(B) summary (TTFT, TPOT, hit_rate, ssd_read_us_total, h2d_us_total, compute_us_total, stall_us_total, VRAM/DRAM/SSD bytes). Print to stderr and write JSON sidecar.
+
+### E-3: predictor wiring (per user: full)
+15. Refactor `slot_pool.cpp` victim selection: replace inline `lc.lru` with a call to `predictor.score(layer, candidates)` exposed via a tiny interface (the existing `predictor.h` already has `lru_predictor` and `eamc_predictor`). Slot_pool calls `predictor.observe(layer, expert_id)` for each unique selected expert in the callback; calls `predictor.score(layer, candidates)` when picking an eviction victim.
+16. Hook `predictor.end_request()` from `llama_moe::end_request` — for `eamc`, dumps the `.eamc` sidecar next to the `.moe.gguf`. On `configure_from_params`, if `.eamc` exists, load it.
+
+### E verification
+- `--moe-predictor lru` and `--moe-predictor eamc` produce identical logits on the golden prompt (predictor only changes eviction).
+- CSV file contains all columns from plan §4.7(A) with at least n_layers rows per generated token.
+- Summary contains all keys from §4.7(B); JSON sidecar parses.
+- EAMC run produces `.eamc` file; reloading on a second invocation skips re-warmup.
+
+## Phase F — Bench + docs
+
+17. In tools/moe-bench/main.cpp finalize: parse `--pp`, `--tg`, `--repeat`; per repeat call `begin_request → llama_decode(prefill) → loop llama_decode(decode) → end_request`; aggregate summaries across repeats (mean + stddev for headline numbers).
+18. Update docs/moe-offload/README.md: remove "still pending" caveats; concrete invocation lines for repack / cli / bench; troubleshooting (slot vs n_uniq budget; sector alignment); EAMC sidecar location.
+
+### F verification
+- `llama-moe-bench --model ...moe.gguf --pp 1024 --tg 256 --repeat 3 --moe-offload --moe-cache-vram-mb 8000` runs without OOM at `--ctx 8192` and prints a stable aggregated summary across repeats.
+- `cmake -B build-moe -DLLAMA_MOE_OFFLOAD=ON -DGGML_CUDA=ON` and default-off (`-DLLAMA_MOE_OFFLOAD=OFF`) both compile clean.
+
+## Relevant files
+
+- `src/moe-offload/slot_pool.{h,cpp}` — D-3 instrumentation; D-4 fix; D-5 callback refactor to use io.h; E-3 predictor wiring; E-1 record_layer.
+- `src/moe-offload/io.{h,cpp}` (NEW, Phase D-5) — worker thread, pinned staging pool, `moe_h2d_stream`, events.
+- `src/moe-offload/cache.{h,cpp}` — currently dormant; either delete or fold its LRU into the predictor interface in E-3.
+- `src/moe-offload/predictor.{h,cpp}` (+ `eamc_predictor`) — wire `observe/score/end_request`; sidecar dump/reload.
+- `src/moe-offload/profiler.{h,cpp}` — `record_layer` API + CSV emission; summary aggregation.
+- `src/moe-offload/runtime.{h,cpp}` — `end_request` summary; `configure_from_params` reloads `.eamc`.
+- `src/moe-offload/loader.cpp` — none expected after D.
+- `src/llama-context.cpp` (≈ line 1285) — currently registers callback only when `streaming_mode()`; keep, but also register a profiler-only callback in non-streaming so E-1 still records rows.
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — add `ggml_backend_cuda_get_stream(ggml_backend_t)` (Phase D-5).
+- `tools/moe-bench/main.cpp` — Phase F orchestrator.
+- `docs/moe-offload/README.md` — Phase F.
+
+## Decisions
+
+- I/O: full async (worker + pinned + `moe_h2d_stream` + `cudaStreamWaitEvent`); keep buffered FILE* read (no Win32 direct I/O yet — deferred to a future polish).
+- Predictor: full wiring with EAMC sidecar.
+- Debug-first for the mmq crash: instrument all loads + every-layer slot_table readback; only escalate to compute-sanitizer if instrumentation is inconclusive.
+- Keep golden-prompt greedy argmax as the regression test (already proven for Phase C); no full GoogleTest suite.
+- Direct-I/O (`FILE_FLAG_NO_BUFFERING|OVERLAPPED`) and `--moe-oracle` remain deferred.
+
+## Further considerations
+1. If D-3 instrumentation shows the slot_table tensor still ends up in a non-`CUDA0` buffer for some graph builds (split / probe / reuse), the fix is to attach the slot_table to the existing topk tensor's backend via a no-op `ggml_view` so the scheduler places it on the same backend as the consumer.
+2. The compute-stream accessor in `ggml-cuda.cu` is a small upstream-touching change; keep it `#ifdef LLAMA_MOE_OFFLOAD`-guarded to avoid surface drift on the default build.
+3. `record_layer` timing for "compute_us" can over-count if the next layer's MoE topk runs before this layer's mul_mat_id finishes (CUDA stream pipelining). For MVP, document this as "approximate compute_us" and prefer cudaEvent-based measurement of just the SSD-read + H2D phases for the headline numbers.
+
+
+# Plan: MoE Offload MVP — Finish D, then E + F
+
+## TL;DR
+Phases A+B+C are GREEN. Phase D-1 (graph remap + per-build slot_table registration) lands; Phase D-2 (streaming eval-callback) is implemented but crashes in `mmq.cu:206` when per-batch `n_uniq` is high (96) even though `n_uniq <= n_slots`. Finish D by instrumenting first, fixing the crash, swapping the in-callback sync `fread`+`tensor_set` for the planned async I/O pipeline (worker thread + pinned staging + `moe_h2d_stream` + `cudaStreamWaitEvent`), then wire profiler/CSV/summary and the EAMC predictor, then finalize `llama-moe-bench` + docs.
+
+## Phase D — finish streaming (blocking)
+
+### D-3 STATUS (2026-05-27 late night):
+- D-3 instrumentation completed in [src/moe-offload/slot_pool.cpp](c:\code\llama.cpp.offload\src\moe-offload\slot_pool.cpp): fprintf(stderr) for every load + per-layer GPU readback.
+- Diagnostic runs at cache=12000 (n_slots=145):
+  * default -ub (512): CRASH at mmq.cu:206 after layer 0 readback. n_uniq=96. All loads correct (CUDA0, offsets, strides). slot_table readback mismatches=0.
+  * `-ub 1`: WORKS. 40 layers readback OK. Output "Okay,".
+  * `-ub 2`: WORKS. Output "Thinking Process".
+  * `-ub 4`: WORKS. 40 layers readback OK.
+  * `-ub 8 `: TBD (slow with CUDA_LAUNCH_BLOCKING=1).
+- Conclusion: crash threshold tied to PER-MICROBATCH n_uniq. ub=4 → 4 tokens × top8 = ≤32 unique expert usage per layer; ub=12+ at default ub → 96 unique. Bug is downstream of our slot table — likely in mul_mat_id kernel when ne02 (slot dim) is 145 and many unique slots are active in one batch.
+- LIKELY ROOT CAUSE: mmq's expert_bounds tracking expects `ne02 == n_experts` to match unique counts well. With sparse usage of 96 of 145 slots, some kernel parameter exceeds a limit, or `ne12` (n_tokens) interaction with `n_expert_used` creates >some bound.
+- NEXT FIX HYPOTHESIS: try making slot tensor's n_slots dimension snap up to a power-of-2 OR ensure n_slots ≥ n_expert when streaming. Simpler: lower the per-microbatch token budget so n_uniq stays small (via `-ub` cap) — but this kills prefill throughput.
+- ALTERNATIVE FIX: make remap_selected_experts also remap THE EXPERT AXIS of slot tensor presentation. Currently slot_tensor->ne[2]=n_slots=145 is passed to mul_mat_id which treats it as the "n_experts" dimension. The graph thinks model has 145 experts, but topk produced ids in [0..255] → remapped to [0..144]. If mul_mat_id's mmq kernel uses ne02 internally in any per-expert allocation sized in a way that interacts with ne12=12 (tokens) × n_expert_used=8 = 96 = n_uniq, that's the cliff.
+- Logs at: c:\code\llama.cpp.offload\build-moe\phaseD3-*.log
+
+### D-3 (debug): isolate the mmq.cu:206 crash
+1. In src/moe-offload/slot_pool.cpp `load_expert_into_slot`, drop the `dump<6` gate; emit one log line per load with `L,e,k,slot, rec.size, stride, tensor_off, write_off, buf_name=ggml_backend_buffer_name(slot_tensor->buffer)`. Cap at ~3000 lines via a global counter.
+2. In `moe_eval_callback`, after writing slot_table, GPU-read it back for **every** layer (not only logical==0 && topk_calls==0), compare to host buffer, log mismatches and the first 8 slot indices.
+3. Run `llama-cli --moe-offload --moe-cache-vram-mb 12000` on the .moe.gguf with the standard golden prompt. Read the trace; verify (a) every slot_tensor buffer is `CUDA0` (not split/CPU), (b) `tensor_off + write_off + rec.size <= buf_size` holds for every load, (c) slot_table readback equals what was written for every layer, (d) all slot indices written are `< n_slots`.
+4. If all 4 hold → the crash is NOT in our load/write path; suspect graph-side. Inspect with `CUDA_LAUNCH_BLOCKING=1` + `compute-sanitizer --tool memcheck --print-limit 50` to capture the OOB address, then compare to the slot tensor base/extent for the failing layer.
+5. Most likely root cause to verify: the slot_table tensor needs `ggml_set_input` removed (already done per code review) AND it must NOT be subject to graph-reuse aliasing across builds. Confirm by adding a unique-name suffix per build counter so the scheduler can never alias a stale tensor pointer.
+
+### D-4 (fix): correct the root cause
+6. Apply the minimal fix from D-3 (one of: load-offset bug, slot_table aliasing, or graph-reuse). Add a one-line assertion in `moe_eval_callback` that `lc.exp2slot[e] < s.n_slots` before writing slot_table. Re-run golden test at `--moe-cache-vram-mb 12000`; assert first-32 tokens match Phase C output.
+7. Stress: rerun at `--moe-cache-vram-mb 4000` (forces frequent eviction). First-32 tokens must still match. 1k-prefill / 256-decode run must not crash.
+
+### D-5 (async I/O pipeline) — per user choice "full async"
+8. Create new src/moe-offload/io.{h,cpp}:
+   - One `std::thread` I/O worker; SPSC ring queue of `io_request { layer, expert, kind, slot, pinned_buf, ev_done }`.
+   - Pinned host staging pool: ring of N buffers, each `expert_blob_size_max` rounded up to 4 KiB, allocated via `cudaHostAlloc(cudaHostAllocDefault)`. Size N = max(2 * n_slots, 64) so the callback can issue an entire layer's misses before blocking.
+   - One CUDA `moe_h2d_stream` (per device), created lazily by querying device id from a slot_tensor's buffer.
+   - Worker loop: pop request → `fread` from buffered FILE* (Phase F may upgrade to `ReadFile(FILE_FLAG_NO_BUFFERING|OVERLAPPED)`; not required now) → `cudaMemcpyAsync(slot.data + slot_idx*stride, pinned, size, H2D, moe_h2d_stream)` → `cudaEventRecord(ev_done, moe_h2d_stream)` → push back to a free-list.
+9. Expose `ggml_backend_cuda_get_stream(ggml_backend_t)` in ggml/src/ggml-cuda/ggml-cuda.cu under `#ifdef LLAMA_MOE_OFFLOAD` (or unconditional accessor — minimal, additive). Plumb that backend handle from `llama_context` into `moe_h2d` init.
+10. Rewrite `moe_eval_callback` miss-path: enqueue 3 I/O requests per missed expert (gate/up/down), keep their `ev_done` handles in `layer_cache::pending_evs`. After the slot_table write, `cudaStreamWaitEvent(compute_stream, ev, 0)` for each pending event, then clear `pending_evs`. (Compute stream is queried via the new accessor.)
+11. Initial residency (Phase C path) still uses the simpler buffered loader so startup behavior is unchanged.
+
+### D verification
+- `--moe-cache-vram-mb 99999` (full residency, streaming OFF) matches vanilla logits within 1e-3 (Phase C gate already verified).
+- `--moe-cache-vram-mb 12000` and `--moe-cache-vram-mb 4000` (streaming) match Phase C output exactly on the golden prompt (greedy argmax).
+- A/B at `--moe-cache-vram-mb 4000` with sync I/O (toggle via env var `MOE_OFFLOAD_SYNC_IO=1`) vs async produces identical logits.
+- No CUDA error / OOB through 1k prefill + 256 decode at `--moe-cache-vram-mb 4000`.
+
+## Phase E — Profiler rows + summary + EAMC wiring
+
+### E-1: profiler
+12. Per-layer event timing in `moe_eval_callback`:
+    - Record CPU-time deltas around the synchronous `fread` (ssd_read_us) and around the eval-callback enqueue (h2d_us_async, end → cudaEventSynchronize before write_off bookkeeping; for fully-async D-5, use `cudaEventElapsedTime` between submit-event and done-event recorded by the I/O worker).
+    - For compute_us: record `cudaEventRecord` on `compute_stream` just before returning from the callback (start) and on the topk node of the NEXT layer (end). Approximation: aggregate per-token via a per-layer running deltas.
+12b. In src/moe-offload/profiler.cpp wire `record_layer(token_idx, phase, il, stats)` exposed via a new `record_layer` API; called from `moe_eval_callback`. Stats include: `k_required, k_hit, k_miss, ssd_read_us, h2d_us, compute_us, stall_us, cache_resident_experts, predictor`.
+13. Open CSV at first record_layer using `runtime_options::profile_csv` path; emit header per plan §4.7(A). Flush per row to survive crashes during early testing.
+
+### E-2: summary
+14. In src/moe-offload/runtime.cpp::end_request, aggregate counters from slot_pool + profiler into the §4.7(B) summary (TTFT, TPOT, hit_rate, ssd_read_us_total, h2d_us_total, compute_us_total, stall_us_total, VRAM/DRAM/SSD bytes). Print to stderr and write JSON sidecar.
+
+### E-3: predictor wiring (per user: full)
+15. Refactor `slot_pool.cpp` victim selection: replace inline `lc.lru` with a call to `predictor.score(layer, candidates)` exposed via a tiny interface (the existing `predictor.h` already has `lru_predictor` and `eamc_predictor`). Slot_pool calls `predictor.observe(layer, expert_id)` for each unique selected expert in the callback; calls `predictor.score(layer, candidates)` when picking an eviction victim.
+16. Hook `predictor.end_request()` from `llama_moe::end_request` — for `eamc`, dumps the `.eamc` sidecar next to the `.moe.gguf`. On `configure_from_params`, if `.eamc` exists, load it.
+
+### E verification
+- `--moe-predictor lru` and `--moe-predictor eamc` produce identical logits on the golden prompt (predictor only changes eviction).
+- CSV file contains all columns from plan §4.7(A) with at least n_layers rows per generated token.
+- Summary contains all keys from §4.7(B); JSON sidecar parses.
+- EAMC run produces `.eamc` file; reloading on a second invocation skips re-warmup.
+
+## Phase F — Bench + docs
+
+17. In tools/moe-bench/main.cpp finalize: parse `--pp`, `--tg`, `--repeat`; per repeat call `begin_request → llama_decode(prefill) → loop llama_decode(decode) → end_request`; aggregate summaries across repeats (mean + stddev for headline numbers).
+18. Update docs/moe-offload/README.md: remove "still pending" caveats; concrete invocation lines for repack / cli / bench; troubleshooting (slot vs n_uniq budget; sector alignment); EAMC sidecar location.
+
+### F verification
+- `llama-moe-bench --model ...moe.gguf --pp 1024 --tg 256 --repeat 3 --moe-offload --moe-cache-vram-mb 8000` runs without OOM at `--ctx 8192` and prints a stable aggregated summary across repeats.
+- `cmake -B build-moe -DLLAMA_MOE_OFFLOAD=ON -DGGML_CUDA=ON` and default-off (`-DLLAMA_MOE_OFFLOAD=OFF`) both compile clean.
+
+## Relevant files
+
+- `src/moe-offload/slot_pool.{h,cpp}` — D-3 instrumentation; D-4 fix; D-5 callback refactor to use io.h; E-3 predictor wiring; E-1 record_layer.
+- `src/moe-offload/io.{h,cpp}` (NEW, Phase D-5) — worker thread, pinned staging pool, `moe_h2d_stream`, events.
+- `src/moe-offload/cache.{h,cpp}` — currently dormant; either delete or fold its LRU into the predictor interface in E-3.
+- `src/moe-offload/predictor.{h,cpp}` (+ `eamc_predictor`) — wire `observe/score/end_request`; sidecar dump/reload.
+- `src/moe-offload/profiler.{h,cpp}` — `record_layer` API + CSV emission; summary aggregation.
+- `src/moe-offload/runtime.{h,cpp}` — `end_request` summary; `configure_from_params` reloads `.eamc`.
+- `src/moe-offload/loader.cpp` — none expected after D.
+- `src/llama-context.cpp` (≈ line 1285) — currently registers callback only when `streaming_mode()`; keep, but also register a profiler-only callback in non-streaming so E-1 still records rows.
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — add `ggml_backend_cuda_get_stream(ggml_backend_t)` (Phase D-5).
+- `tools/moe-bench/main.cpp` — Phase F orchestrator.
+- `docs/moe-offload/README.md` — Phase F.
+
+## Decisions
+
+- I/O: full async (worker + pinned + `moe_h2d_stream` + `cudaStreamWaitEvent`); keep buffered FILE* read (no Win32 direct I/O yet — deferred to a future polish).
+- Predictor: full wiring with EAMC sidecar.
+- Debug-first for the mmq crash: instrument all loads + every-layer slot_table readback; only escalate to compute-sanitizer if instrumentation is inconclusive.
+- Keep golden-prompt greedy argmax as the regression test (already proven for Phase C); no full GoogleTest suite.
+- Direct-I/O (`FILE_FLAG_NO_BUFFERING|OVERLAPPED`) and `--moe-oracle` remain deferred.
+
+## Further considerations
+1. If D-3 instrumentation shows the slot_table tensor still ends up in a non-`CUDA0` buffer for some graph builds (split / probe / reuse), the fix is to attach the slot_table to the existing topk tensor's backend via a no-op `ggml_view` so the scheduler places it on the same backend as the consumer.
+2. The compute-stream accessor in `ggml-cuda.cu` is a small upstream-touching change; keep it `#ifdef LLAMA_MOE_OFFLOAD`-guarded to avoid surface drift on the default build.
+3. `record_layer` timing for "compute_us" can over-count if the next layer's MoE topk runs before this layer's mul_mat_id finishes (CUDA stream pipelining). For MVP, document this as "approximate compute_us" and prefer cudaEvent-based measurement of just the SSD-read + H2D phases for the headline numbers.
+
