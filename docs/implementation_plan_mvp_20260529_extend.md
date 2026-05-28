@@ -19,7 +19,11 @@ each session. One phase per session.
   harness landed; drift gate measures `max|d|=4.64e-01` at step 3 (above
   1e-3 tolerance); bug is real, plan §3 speculative fix did not close it,
   deferred to Phase L
-- K — `tests/moe-offload/` test set
+- **K — DONE (2026-05-28, this session)** — `tests/moe-offload/` test set:
+  three C++ unit tests landed under the `moe-offload` CTest label
+  (`test-eamc-cosine`, `test-lru-eviction`, `test-manifest-roundtrip`);
+  all four moe-offload labelled tests pass (including the Phase-G
+  `test-cuda-stream` smoke).
 - L — README truth-up (also: streaming numeric drift; small-cache /
   multi-token-prompt deadlocks; wire `slot_pool_shutdown_io` into runtime
   teardown — see Phase H deviation below)
@@ -634,3 +638,212 @@ three small C++ unit tests (`test-eamc-cosine.cpp`,
 with CTest. These are dev-box only and do not require the multi-GB
 model. Confirm they pass under the existing `build-moe` build before
 closing the phase.
+
+---
+
+## Phase K — DONE (2026-05-28)
+
+Goal: Minimal `tests/moe-offload/` test set per source plan §3 Phase K.
+Add three small C++ unit tests under the existing
+`LLAMA_MOE_OFFLOAD`-gated block in `tests/CMakeLists.txt`, registered
+with CTest under the `moe-offload` label.
+
+### Files added
+
+- `tests/moe-offload/test-eamc-cosine.cpp`
+  - Constructs an `eamc_predictor` (`n_layers=4`, `n_experts=8`,
+    `capacity=3`, `top_k=2`) via `make_predictor`.
+  - Seeds the corpus with three synthetic patterns: A=`{0,1}`,
+    B=`{6,7}`, C=`{3,4}` on every layer.
+  - **Cosine ordering**: begins a new request, observes only layer 0 of
+    pattern A, and asserts `score(1,0) > score(1,6)` and
+    `score(1,1) > score(1,7)`. Then verifies symmetry with a B-prefix:
+    `score(1,6) > score(1,0)`.
+  - **Redundancy-replacement on full insert**: appends a near-duplicate
+    of A (corpus is already at capacity). Then with a fresh A-prefix
+    query verifies A-experts still beat both B- and C-experts — i.e.
+    the evictor removed a redundant A row, not B or C.
+  - LRU-fallback sanity: query before any `observe` returns finite.
+- `tests/moe-offload/test-lru-eviction.cpp`
+  - Constructs an `lru_predictor` (`n_layers=2`, `n_experts=8`).
+  - Deterministic 6-step sequence on layer 0 (with one refresh of
+    expert 0) plus one step on layer 1.
+  - Asserts exact `score()` values for every touched expert (2.0, 3.0,
+    3.0, 4.0, 5.0 on layer 0; 6.0 on layer 1), the victim ordering
+    (`s1 < s2`, `s1 < s3`, `s1 < s0`, `s1 < s4`), per-layer
+    isolation (`l1_e0 == 0`), and out-of-range query defaults
+    (`score(-1,0) == 0`, `score(0,n_experts) == 0`).
+- `tests/moe-offload/test-manifest-roundtrip.cpp`
+  - Skips with exit 0 when `LLAMA_MOE_TEST_GGUF` is unset (the default
+    state in CI / for fresh clones).
+  - When set, opens the GGUF via the public ggml C API
+    (`gguf_init_from_file`, `gguf_get_*`), asserts
+    `moe_offload.version == 2`, reads `n_moe_layers` and
+    `n_experts_per_layer`, honors `moe_offload.layer_ids` when
+    present, and validates that `moe_offload.expert_blob.table`
+    is a `UINT64` array of length
+    `n_layers * n_experts_per_layer * 3 * 2`.
+  - Range-checks every `(rel_offset, size)` record against the
+    on-disk file size: `data_offset + rel + size <= file_size`,
+    `size > 0`, not-all-zero records. Uses `_fseeki64`/`_ftelli64`
+    on Windows to handle the >2 GiB Q4_K_M file.
+
+### Files modified
+
+- `tests/CMakeLists.txt` — appended three `llama_build_and_test`
+  invocations inside the existing `if (LLAMA_MOE_OFFLOAD)` block, all
+  with `LABEL "moe-offload"`. The two predictor tests pass
+  `${PROJECT_SOURCE_DIR}/src/moe-offload/predictor.cpp` as an extra
+  source and add `${PROJECT_SOURCE_DIR}/src` to the include path; the
+  manifest test only needs the public gguf headers (already on the
+  default ggml include path via `llama-common`).
+
+### Deviations from source plan §3 Phase K
+
+1. **No separate `tests/moe-offload/CMakeLists.txt`.** Source plan §3
+   asked for a dedicated subdirectory CMake file. The existing
+   `tests/CMakeLists.txt` already has a `LLAMA_MOE_OFFLOAD`-gated
+   block (added in Phase G for `test-cuda-stream`), so the three new
+   tests were appended there. Net effect for CTest registration and
+   labelling is identical, and the build system stays flatter.
+2. **No new public headers exported from `predictor.h` / `loader.h`.**
+   `make_predictor` and the predictor classes are not `LLAMA_API`-
+   tagged, so they cannot be linked from a test exe against
+   `llama.dll` on Windows. Solution: compile `predictor.cpp` directly
+   into each predictor test binary as an extra source. The test exe
+   ends up with its own private copy of the predictor code; this is
+   safe because none of those symbols leak across the DLL boundary.
+   No public API was changed.
+3. **EAMC sidecar round-trip sub-check is intentionally skipped.**
+   Source plan §3 enumerated three sub-checks for the EAMC test
+   (cosine ordering, redundancy replacement, sidecar round-trip). The
+   predictor surface in `src/moe-offload/predictor.{h,cpp}` does not
+   currently implement load/save (the only sidecar hook is the
+   `// Phase E-3: let predictor finalize (e.g. EAMC sidecar dump).`
+   comment in `runtime.cpp`). Sidecar persistence is therefore
+   carried into Phase L / post-MVP. The Phase K test covers cosine
+   ordering and redundancy eviction; that is the partial coverage
+   that source plan §1 acknowledged.
+4. **`test-manifest-roundtrip` reads the model via env var rather
+   than a fixed path or CTest fixture.** Source plan §3 says "opens
+   the user's `.moe.gguf`" and Phase K closing note says these tests
+   "are dev-box only and do not require the multi-GB model" — these
+   are in tension. The chosen compromise: env-var-gated. With
+   `LLAMA_MOE_TEST_GGUF` unset, the test exits 0 immediately
+   (a recognized skip), so the CTest `moe-offload` label passes from
+   a fresh clone with no model present. On the dev box, setting the
+   env var exercises the full validation path.
+5. **Used `_fseeki64`/`_ftelli64` on Windows.** The first build of
+   `test-manifest-roundtrip` failed against the real model because
+   `ftell` returns `long` (32-bit on MSVC) and silently truncates on
+   the 22 GB Q4_K_M file. Fixed before claiming Phase K acceptance.
+
+### Build + test verification
+
+Configure (re-run to enable tests in the existing build-moe tree):
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" -S c:\code\llama.cpp.offload `
+    -B c:\code\llama.cpp.offload\build-moe -DLLAMA_MOE_OFFLOAD=ON `
+    -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF `
+    -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
+```
+
+Build:
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-moe `
+    --config Release --target test-eamc-cosine test-lru-eviction test-manifest-roundtrip
+```
+
+All three exes link clean.
+
+Run individually (no env var → manifest test self-skips):
+
+```
+==== test-eamc-cosine ====
+[test-eamc-cosine] OK
+exit=0
+==== test-lru-eviction ====
+[test-lru-eviction] OK
+exit=0
+==== test-manifest-roundtrip ====
+[test-manifest-roundtrip] LLAMA_MOE_TEST_GGUF not set — skipping.
+exit=0
+```
+
+Run manifest test against the real model on the dev box:
+
+```
+[test-manifest-roundtrip] table: 30720 records, 0 zero-pair(s), file_size=22016515200, data_offset=11481728
+[test-manifest-roundtrip] OK (version=2, n_layers=40, n_experts=256)
+exit=0
+```
+
+30720 records = 40 layers × 256 experts × 3 kinds — matches the
+`expert_blob.table` size formula exactly.
+
+CTest run (label `moe-offload`):
+
+```
+> ctest --test-dir c:\code\llama.cpp.offload\build-moe -C Release -L moe-offload --output-on-failure
+    Start 43: test-cuda-stream
+1/4 Test #43: test-cuda-stream .................   Passed    0.96 sec
+    Start 44: test-eamc-cosine
+2/4 Test #44: test-eamc-cosine .................   Passed    0.01 sec
+    Start 45: test-lru-eviction
+3/4 Test #45: test-lru-eviction ................   Passed    0.01 sec
+    Start 46: test-manifest-roundtrip
+4/4 Test #46: test-manifest-roundtrip ..........   Passed    0.01 sec
+
+100% tests passed, 0 tests failed out of 4
+Label Time Summary:
+moe-offload    =   0.99 sec*proc (4 tests)
+```
+
+No other test labels were exercised in this phase; vanilla / non-MoE
+tests were not re-run because no shared source changed (only
+`tests/CMakeLists.txt` and three new files under `tests/moe-offload/`).
+
+### Status checklist
+
+- [x] K.1 `test-eamc-cosine.cpp` — cosine ordering + redundancy
+      replacement on full insert (sidecar sub-check deferred).
+- [x] K.2 `test-lru-eviction.cpp` — exact hand-computed
+      `last_use` values + victim ordering + per-layer isolation.
+- [x] K.3 `test-manifest-roundtrip.cpp` — env-var-gated; passes
+      against `Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`.
+- [x] K.4 CTest registration under label `moe-offload` (4/4 pass).
+- [x] K.5 No public-header API changes; predictor.cpp recompiled
+      into the two predictor test exes.
+- [x] K.6 this extend.md updated.
+
+### Decisions captured
+
+- Predictor tests compile `predictor.cpp` directly rather than
+  exporting `make_predictor` via `LLAMA_API`. Keeps the public
+  surface unchanged; the per-test duplicate copy is small and
+  isolated.
+- Manifest test stays env-var-gated. CTest passes from a fresh
+  clone with no model present; dev-box runs validate against the
+  real `.moe.gguf`.
+- EAMC sidecar persistence is genuinely missing from the codebase
+  and is escalated to Phase L (or post-MVP). The Phase K test only
+  covers the in-memory cosine + redundancy behaviour that already
+  exists.
+
+---
+
+## Next session — Phase L
+
+Per the Phase order header, Phase L is the README truth-up plus the
+hygiene items accumulated across H/I/J:
+
+- streaming numeric drift (`max|Δlogit|=4.64e-01` from Phase J);
+- small-cache deadlocks (`<= 8000 MiB`) and multi-token-prompt hangs
+  observed during the Phase J harness;
+- wire `slot_pool_shutdown_io` into runtime teardown (see Phase H
+  shutdown exit `-1073740791`);
+- update `docs/moe-offload/README.md` with the Phase H/I/J/K
+  measured numbers and the new test surface.
+
