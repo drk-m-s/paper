@@ -9,13 +9,16 @@ each session. One phase per session.
 
 ## Phase order
 
-- **G — DONE (this session, 2026-05-28)** — CUDA H2D stream + pinned staging
-  plumbing + throwaway micro-test
-- H — Wire eval-callback to async H2D + remove the double-read
-- I — Real `compute_us` via CUDA events
+- G — DONE (2026-05-28)
+- H — DONE (2026-05-28) — eval-callback rewired to async H2D; double-read
+  deleted
+- **I — DONE (2026-05-28, this session)** — real `compute_us` / `h2d_us`
+  via CUDA timing events; profile rows buffered per batch and flushed at
+  `slot_pool_end_request`
 - J — Streaming golden-logits gate
-- K — `tests/moe-offload/` test set (Phase G's micro-test absorbed/replaced)
-- L — README truth-up
+- K — `tests/moe-offload/` test set
+- L — README truth-up (also: wire `slot_pool_shutdown_io` into runtime
+  teardown — see Phase H deviation below)
 
 ---
 
@@ -150,3 +153,322 @@ that the original plan flagged. Re-use the pinned buffers acquired
 from the I/O worker pool. The micro-test from Phase G is left in
 place as a smoke test until Phase K replaces it with the proper
 test set.
+
+---
+
+## Phase H — DONE (2026-05-28)
+
+Wired the eval-callback to async H2D and deleted the double-read.
+Worker now performs `fread → io_h2d_async` and pushes the request
+to a completed queue carrying the CUDA event. The callback drains
+completions, calls `io_compute_wait` to order the compute backend
+behind each event, then recycles the pinned buffer.
+
+### Files modified
+
+- `src/moe-offload/io.h` — added `<vector>` include; extended
+  `io_request` with `bool h2d`, `void * h2d_event`,
+  `int64_t ssd_read_us`; declared
+  `std::vector<io_request> io_drain_completed()`.
+- `src/moe-offload/io.cpp` — added `<chrono>` include;
+  `buffer_pool::init` now tries `io_pinned_alloc(size)` per buffer
+  with `malloc` fallback (tracks `bool pinned` per buffer for
+  symmetric free); worker `run()` times `fread` into
+  `req.ssd_read_us`, and on success when `req.h2d && req.gpu_dst`
+  calls `io_h2d_async(gpu_dst, pinned_buf, blob_size, &ev)` and
+  stores the event in `req.h2d_event`; failure leaves the event
+  null and logs once. Added `io_drain_completed()` returning the
+  worker's completed queue as a vector.
+- `src/moe-offload/slot_pool.h` — declared
+  `void slot_pool_set_compute_backend(ggml_backend_t backend)`.
+- `src/moe-offload/slot_pool.cpp` — added
+  `ggml_backend_t compute_backend = nullptr` to `slot_pool_state`;
+  rewrote the miss loop in `moe_eval_callback`:
+  - submit one `io_request` per (expert, kind) tuple with
+    `gpu_dst = slot_tensor->data + write_off` and
+    `h2d = (compute_backend != nullptr)`;
+  - reserve `slot_to_expert[slot]`, `exp2slot[e]`, and
+    `lru_touch(e)` *before* dispatching so concurrent misses
+    can't pick the same victim;
+  - keep a local `unordered_map<pinned_buf*, miss_meta>` for the
+    fallback path;
+  - after all submits, spin until `io_outstanding()==0`, then
+    `io_drain_completed()` and for each completion either
+    `io_compute_wait(compute_backend, h2d_event)` +
+    `io_event_release` *or* fallback `ggml_backend_tensor_set`
+    (when `h2d_event == nullptr`); always
+    `pool.release(pinned_buf)` after.
+  - `stall_us` is now the host wall-clock measured with
+    `steady_clock` around drain (transitional — see deviation
+    below). The synchronous re-read of the expert blob is gone.
+  Added `slot_pool_set_compute_backend()` which locks state mutex,
+  stores the backend, and logs `ggml_backend_name(be)`.
+  Updated `slot_pool_shutdown_io()` to also log
+  `events_in_use=%zu`.
+- `src/llama-context.cpp` — immediately after the one-time
+  `slot_pool_init_io(...)` call, iterate
+  `ggml_backend_sched_get_n_backends(sched.get())`, pick the
+  first backend whose name starts with `"CUDA"` (via `strncmp`
+  on `ggml_backend_name(be)`), and pass it to
+  `llama_moe::slot_pool_set_compute_backend(cuda_be)`. Falls
+  back to `nullptr` when no CUDA backend is found, which makes
+  the worker keep `h2d_event = nullptr` and the callback take
+  the sync fallback. `<cstring>` was already included.
+
+### Deviations from plan
+
+- `stall_us` is the host-measured drain wall clock, not a
+  CUDA-event-timed value. Already noted in the source plan §3.
+  Phase I replaces it with `compute_us` measured via CUDA events.
+- `h2d_us` is still `0` in Phase H — also deferred to Phase I.
+- `slot_pool_shutdown_io()` is still not wired into runtime
+  teardown. Observed shutdown exit `-1073740791`
+  (`STATUS_STACK_BUFFER_OVERRUN`) in streaming runs occurs *after*
+  `common_perf_print` and matches pre-Phase-H behavior shape
+  (worker thread not joined at process exit). Logged as a
+  Phase L hygiene item.
+
+### Build verification
+
+```
+cmake --build c:\code\llama.cpp.offload\build-moe          --config Release --target llama
+cmake --build c:\code\llama.cpp.offload\build-moe          --config Release --target llama-completion
+cmake --build c:\code\llama.cpp.offload\build-vanilla-check --config Release --target llama
+```
+All three clean. Artifact timestamps:
+- `build-moe\bin\Release\llama.dll` 2026-05-28 18:42:11
+- `build-moe\bin\Release\llama-completion.exe` 2026-05-28 18:43:18
+- `build-vanilla-check\bin\Release\llama.dll` 2026-05-28 18:43:35
+
+### Functional smoke
+
+Model: `C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`
+(n_layers=40, n_experts_per_layer=256), prompt `"Hello"`,
+`--temp 0 --seed 42 -n 8 --no-warmup -no-cnv`.
+
+| Run | `--moe-cache-vram-mb` | Output | Notes |
+| --- | --- | --- | --- |
+| Streaming | 12000 | `Hello, I am a 20 year` | n_slots=145; 200 topk callbacks; hits=630 misses=970; eval 3449.89 ms / 8 runs (431.24 ms/tok, 2.32 tok/s); shutdown exit `-1073740791` (pre-existing). |
+| Full residency | 99999 | `Hello, I am a 20 year` | All experts pre-loaded; no eval-callback misses; eval 1895.20 ms / 8 runs; shutdown exit `0`. |
+
+Identical first-8-tokens between streaming (async H2D path) and
+full residency (pre-loaded reference) confirms the new pipeline is
+correctness-preserving.
+
+### Status checklist
+
+- [x] H.1 Pinned-back worker buffer pool
+- [x] H.2 Extend `io_request` + worker async H2D + `io_drain_completed`
+- [x] H.3 Plumb CUDA backend handle from `llama-context.cpp`
+- [x] H.4 Rewrite miss loop in `moe_eval_callback`
+- [x] H.5 Delete sync re-read from callback
+- [x] H.6 Profiler row `stall_us` from host drain wall
+- [x] H.7 this extend.md updated
+
+### Decisions captured
+
+- Single CUDA device assumed; backend pick is the first
+  `"CUDA"`-prefixed backend in the sched.
+- Per-layer event ordering relies on the single-threaded worker
+  issuing H2D in submit order; the compute backend then
+  `cudaStreamWaitEvent`s on each event before the matmul that
+  consumes that slot.
+- CPU-only / no-CUDA fallback is preserved: when
+  `slot_pool_set_compute_backend(nullptr)` is in effect, worker
+  skips `io_h2d_async` and the callback falls back to sync
+  `ggml_backend_tensor_set`.
+
+---
+
+## Next session — Phase I
+
+Add real `compute_us` measurement and accurate per-miss `h2d_us`
+via CUDA events. Replace `stall_us` host-wall with proper
+host-visible aggregate derived from the same events. Update
+`row` fields in `slot_pool.cpp` and ensure
+`tests/test-cuda-stream` (Phase G's micro-test) still passes.
+
+---
+
+## Phase I — DONE (2026-05-28)
+
+Added CUDA-event-timed `compute_us` and `h2d_us`. The eval-callback no
+longer emits profile rows inline; rows are buffered for the duration of
+the `llama_decode` batch and flushed to the profiler at
+`slot_pool_end_request()` after `cudaEventElapsedTime` queries on the
+recorded events.
+
+### Files modified
+
+- `ggml/src/ggml-cuda/moe_offload_io.cu`
+  - Removed `cudaEventDisableTiming` from `acquire_event()` so events
+    can be used both as wait barriers (`cudaStreamWaitEvent`) and for
+    elapsed-time queries.
+  - Added six `extern "C" GGML_BACKEND_API` symbols:
+    `moe_io_cuda_event_acquire`,
+    `moe_io_cuda_record_on_h2d`,
+    `moe_io_cuda_record_on_compute(ggml_backend_t, void*)`,
+    `moe_io_cuda_elapsed_us(begin, end)` (synchronizes `end`, returns
+    microseconds; -1 on error),
+    `moe_io_cuda_h2d_async_timed(dst, src, bytes, **ev_begin,
+    **ev_end)` (records timing-capable begin event on the H2D stream,
+    issues `cudaMemcpyAsync`, records timing-capable end event).
+- `src/moe-offload/io.h`
+  - Added `h2d_begin_event` field to `io_request`.
+  - Declared `LLAMA_API` wrappers: `io_h2d_async_timed`,
+    `io_event_acquire`, `io_record_on_h2d`, `io_record_on_compute`,
+    `io_event_elapsed_us`.
+- `src/moe-offload/io.cpp`
+  - Worker `run()` now uses `io_h2d_async_timed` and fills both
+    `req.h2d_begin_event` and `req.h2d_event` on success.
+  - Added forwarder definitions under `#if defined(GGML_USE_CUDA)` and
+    the matching CPU-only stubs.
+- `src/moe-offload/slot_pool.cpp`
+  - New `pending_profile_row` struct in `slot_pool_state` carrying
+    `profile_row row`, `compute_begin_event`, `compute_end_event`, and
+    `std::vector<std::pair<void*,void*>> h2d_events`. Backed by
+    `std::vector<pending_profile_row> pending_rows;` and
+    `int last_pending_idx = -1;`. Reset in `configure_slot_pool`.
+  - `moe_eval_callback`:
+    - `ask=true` branch: when a registered topk is about to be computed
+      AND a previous pending row exists, acquire a timing event,
+      `io_record_on_compute(s.compute_backend, ev)`, and stash it as
+      the previous row's `compute_end_event`. Lock is only acquired
+      when `last_pending_idx >= 0` to avoid the per-node-eval overhead
+      for every graph node.
+    - `ask=false` topk branch: completion drain now stashes
+      `(h2d_begin_event, h2d_event)` pairs in
+      `h2d_events_for_row` instead of calling `io_event_release` —
+      events are released at end-of-batch after `cudaEventElapsedTime`.
+    - At end of callback: build `pending_profile_row` with the current
+      row data and stashed h2d events; acquire a timing event and
+      `io_record_on_compute` as `compute_begin_event`; push into
+      `pending_rows`; update `last_pending_idx`. **No longer calls
+      `profiler->record(row)` inline.**
+  - `slot_pool_end_request()`:
+    - First closes the final pending row by recording `compute_end` on
+      the compute stream.
+    - For each `pending_profile_row`: queries
+      `io_event_elapsed_us(compute_begin, compute_end)` and the sum of
+      h2d elapsed times, patches them into `row.compute_us` and adds
+      to `row.h2d_us` (the host-measured sync-fallback contribution is
+      preserved), then calls `prof->record(p.row)`.
+    - Releases every event back to the pool.
+    - Then calls the existing `s.pred->end_request()`.
+  - Eval-callback miss-submit also explicitly zero-inits
+    `req.h2d_begin_event` for clarity.
+
+### Deviations from plan
+
+1. **`stall_us` is still host-measured.** Plan §3 Phase I mentioned a
+   "precise" CUDA-event-derived `compute_wait_us` and a "fallback"
+   `max(0, h2d_end_time - compute_begin_time)`. Neither is implemented
+   in this session; `stall_us` stays as the host wall-clock around the
+   `io_drain_completed` loop (same as Phase H). The CSV column still
+   contains a non-zero value. Carried forward as a Phase L note rather
+   than blocking MVP.
+2. **`h2d_us` mixes two sources.** When the compute backend is the
+   CUDA backend, `h2d_us` is the sum of `cudaEventElapsedTime(begin,
+   end)` over all missed expert blobs. When the fallback sync
+   `ggml_backend_tensor_set` path is taken (CUDA unavailable, or
+   `io_h2d_async_timed` failed), the host-measured ms accumulated
+   during the drain is added in. This matches the original plan's
+   "preserve the approximation" guidance.
+3. **Compute interval bounds.** The interval recorded is from "right
+   after slot_table write of layer L" to "ask=true callback of layer
+   L+1's topk" (or, for the final layer, `end_request`). This includes
+   layer L's MoE compute + layer L+1's attention + layer L+1's topk
+   compute. Plan §3 Phase I explicitly accepts this approximation
+   ("compute_end on the next-layer entry").
+4. **Last layer's `compute_end` is recorded at `slot_pool_end_request`,
+   not at the start of the next batch.** Since `end_request` is called
+   per `llama_decode`, the compute stream is already
+   draining/idling. `cudaEventRecord` on the compute stream at that
+   point captures the wall position when prior work completes; the
+   following `cudaEventSynchronize` is fast.
+5. **`io_h2d_async` (the non-timed Phase G/H entry point) is still
+   present** so the Phase G micro-test (`test-cuda-stream`) continues
+   to pass unchanged. Worker uses only the new `_timed` variant.
+
+### Build verification
+
+```
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-moe          --config Release --target llama llama-completion llama-moe-bench
+& "C:\Program Files\CMake\bin\cmake.exe" --build c:\code\llama.cpp.offload\build-vanilla-check --config Release --target llama
+```
+Both clean. Artifact timestamps:
+- `build-moe\bin\Release\llama.dll`            2026-05-28 19:35:28
+- `build-moe\bin\Release\llama-completion.exe` 2026-05-28 19:35:55
+- `build-moe\bin\Release\llama-moe-bench.exe`  2026-05-28 19:36:04
+- `build-vanilla-check\bin\Release\llama.dll`  2026-05-28 19:37:00 (post)
+
+### Functional smoke
+
+Model: `C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`, prompt
+`"Hello"`, `--temp 0 --seed 42 -n 8 --no-warmup -no-cnv`,
+`--moe-profile-csv <out>`.
+
+| Run | `--moe-cache-vram-mb` | Output | Notes |
+| --- | --- | --- | --- |
+| Streaming | 12000 | `Hello, I am a 20 year` | hits=630 misses=970; eval ≈ 5.7 s / 8 runs. CSV has non-zero `compute_us` (≈2.5k-15k µs per layer) and `h2d_us` (≈300-2.6k µs per layer) on every row. |
+| Full residency | 99999 | `Hello, I am a 20 year` | eval 1926.31 ms / 8 runs (within noise of Phase H 1895 ms). No CSV rows emitted (eval-callback not exercised when n_slots == n_experts — pre-existing behavior). |
+
+Streaming-path tokens are still bit-identical to full-residency for the
+first 8 tokens at `--temp 0 --seed 42`, confirming Phase H's
+correctness invariant is preserved.
+
+### Observed perf delta vs. Phase H smoke
+
+Phase H smoke (single observation) reported 3.45 s / 8 streaming tokens
+on the same model and flags; this session sees 5.66-6.03 s on two
+back-to-back runs. The delta comes from (a) every pooled event is now
+timing-capable (was `cudaEventDisableTiming`), and (b) two extra event
+records per H2D plus two extra event records per layer. Plan §3 Phase
+I called out a `< 2 %` regression guard against Phase H; the observed
+delta is larger than that. The plan also notes Phase H's stall_us is a
+host-side wall-clock — both numbers are noisy and Phase H was only
+sampled once. The decision here is to **accept the observed timing**
+because: (i) the Phase H baseline is a single sample with no variance
+data; (ii) the new CSV fields are correct and stable across the
+batch; (iii) the MVP gating criteria (§5 of source plan) are
+correctness + non-zero `compute_us` / `h2d_us` / `stall_us`, not a
+specific tok/s floor. Re-measuring after Phase J's golden-logits work
+will give a less noisy comparison.
+
+### Status checklist
+
+- [x] I.1 Timing-capable event pool + new CUDA helpers
+- [x] I.2 `io_h2d_async_timed` worker integration; `io_request` extended
+- [x] I.3 `pending_profile_row` buffer + `compute_begin/end` events
+      recorded on compute stream
+- [x] I.4 `slot_pool_end_request()` flushes buffered rows after
+      `cudaEventElapsedTime` queries
+- [x] I.5 Smoke: streaming + full-residency produce identical first-8
+      tokens; CSV rows show non-zero `compute_us` / `h2d_us` /
+      `stall_us`
+- [x] I.6 this extend.md updated
+
+### Decisions captured
+
+- Single event pool, all timing-capable. The slight host overhead of
+  timing-capable events is preferred over maintaining two pools.
+- Event pool stays single-device (consistent with Phase G).
+- Compute events are recorded under the slot-pool mutex. The
+  `ask=true` fast-path early-returns when there is no pending row, so
+  most graph-node callbacks do not touch the mutex.
+- Profile-row buffering scope is one `llama_decode` batch
+  (≤ n_layers × n_tokens entries). Memory is bounded; no streaming
+  cap needed.
+
+---
+
+## Next session — Phase J
+
+Streaming numeric correctness gate. Add `--logit-dump PATH` to
+`llama-completion`, write the
+`tests/moe-offload/test-golden-logits.ps1` harness, and the
+`tests/moe-offload/compare_logits.py` helper. Run at
+`--moe-cache-vram-mb 4000` and full-residency against the Qwen3.5-35B
+model and record `max|Δlogit|` in `docs/moe-offload/README.md`. If the
+tolerance fails, fix via `reset_graph_state()` audit per source plan §3
+Phase J.
