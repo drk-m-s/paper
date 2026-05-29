@@ -1005,3 +1005,121 @@ Post-MVP cleanup, candidates in priority order:
    learned predictors.
 
 
+
+
+---
+
+## Phase M — IN PROGRESS (2026-05-28)
+
+Goal: fix the streaming numerical drift (`max|?logit| = 1e-3`) and the
+`prefetch_all_experts` full-residency crash so the Phase J harness runs
+end-to-end on a clean tree.
+
+### M.1 — Prefetch full-residency crash: FIXED
+
+- Root cause: `intercept_expert_tensor` allocates one `slot_table` per
+  layer at model-load. The scheduler binds backend buffers only to
+  tensors that appear in the built compute graph. Layers whose MoE
+  block is not part of the current graph (e.g. when the output head
+  replaces FFN on the last layer) leave their slot tensors with
+  `slot->buffer == nullptr`. `populate_slot_tables_identity` already
+  guards on this, but `prefetch_all_experts` did not — the per-expert
+  `ggml_backend_tensor_set` then trips `GGML_ASSERT(buf != NULL)`.
+- Fix (`src/moe-offload/slot_pool.cpp` ~L470): `if (!slot->buffer)
+  continue;` in the per-expert disk-load loop.
+- Verified: full-residency golden-logits run completes, produces
+  `Hello, I am a` and a 3,973,136 B `logits-full-m1.bin` reference.
+
+### M.2 — Streaming drift: localized but NOT fixed
+
+Instrumented the eval-callback with env-gated diagnostics
+(`LLAMA_MOE_DEBUG_SYNC`, `NO_ASYNC`, `NO_HIT`, `ID_FILL`, `EVICT`,
+`CB_NOP`, `CB_PROOF`) and ran each against the Phase J harness on
+`Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`, `-p "Hello" -n 4 --temp 0 --seed 42`,
+`--moe-cache-vram-mb 12000` (`n_slots = 145 < n_expert = 256`). All
+inner-bookkeeping variants produce **bit-identical** 0.46 drift
+(md5 `1e86cc87…`). `CB_NOP` (early-return callback) raises drift to
+16.18 (md5 `70456e…`) — positive control that the callback's writes
+are consumed.
+
+Per-step decomposition:
+
+| step | max\|?logit\| | mean\|?logit\| |
+|------|---------------|----------------|
+| 0    | 0.000e+00     | 0.000e+00      |
+| 1    | 3.292e-01     | 4.819e-02      |
+| 2    | 3.023e-01     | 5.000e-02      |
+| 3    | 4.639e-01     | 7.846e-02      |
+
+**Step 0 (prompt forward, cold cache) matches full-residency exactly.**
+Drift accumulates from step 1+. `EVICT` debug shows `n_slots=145` per
+layer with **0 evictions** across all 160 callbacks (uniq = 8 « 145
+free), so the bug is not eviction-related at this cache size.
+`NO_HIT` (clear cache per callback, force every uniq = MISS) is also a
+no-op on output — so cross-step HIT reuse isn't it either.
+
+Ruled out by the diagnostics:
+
+- stream-ordering of the `slot_table` `ggml_backend_tensor_set` (SYNC);
+- async cudaMemcpyAsync H2D path for slot weights (NO_ASYNC);
+- cross-step HIT reuse / cache state (NO_HIT);
+- mmq reading non-top-k `slot_table` entries (ID_FILL ? identity fill
+  vs zero fill, no observable effect).
+
+**Open hypothesis, highest leverage, not yet tested**: slot weight
+tensor memory is being overwritten between step 0's load and step 1's
+`mul_mat_id` consumer — either by mmq writing to scratch in the slot
+tensor's buffer, or by a scheduler-allocated temporary aliasing the
+slot tensor's memory. The pre-existing comment in
+`prefetch_all_experts` (`src/moe-offload/slot_pool.cpp` ~L405) explicitly
+notes the mmq kernel "can access unused / excess slots when processing
+large batches" — extended-access semantics in mmq make this plausible.
+
+Next concrete diagnostic, **not yet implemented**: at end of each
+callback, content-hash the first 1 KiB of slots 0..3 via
+`ggml_backend_tensor_get`. Compare across (token, layer) records. If
+slot content changes between callbacks without our explicit
+`tensor_set` / `io_h2d`, the hypothesis is confirmed.
+
+### M.3 — Eviction safety widening (defensive, no test effect here)
+
+`reserved_this_call` previously held only the experts loaded as MISSes
+in the current callback. Widened it to all `uniq` experts (HITs +
+MISSes) so a HIT can never be picked as eviction victim by a later
+MISS in the same callback. No observable effect at 12 GiB cache (no
+evictions occur) but a latent correctness improvement at smaller
+caches.
+
+### Files modified
+
+- `src/moe-offload/slot_pool.cpp`
+  - M.1 null-buffer guard in `prefetch_all_experts`.
+  - M.3 widen `reserved_this_call` to all `uniq` experts.
+  - M.2 env-gated diagnostics (kept; cost = one `getenv` per callback
+    when env unset).
+  - Added `#include <cstdlib>`.
+- `docs/moe-offload/known-issues.md` — closed the prefetch crash entry
+  in a new **Closed in Phase M** section; expanded the streaming drift
+  entry with M.2 findings, the ruled-out hypotheses, and the proposed
+  next diagnostic.
+
+### Deviation
+
+Phase M not closed in this session. The instrument-first plan cheaply
+ruled out four plausible causes; the remaining (slot weight cross-step
+content corruption) requires a more invasive `ggml_backend_tensor_get`
+content-hash dump and is carried forward.
+
+### Next session — Phase M continuation
+
+1. Add `LLAMA_MOE_DEBUG_SLOT_HASH` to the eval-callback: read back
+   `ggml_backend_tensor_get(slot_tensor, buf, 0, 1024)` for slots 0..3
+   at layer 0 and FNV1a-hash, print `(tok, layer, slot, hash)`.
+2. Run 4-step streaming generation; diff hashes per slot across
+   consecutive callbacks. If a slot's hash changes without a matching
+   eviction/load record, scheduler aliasing or kernel write-back is
+   the bug.
+3. Once root cause identified, apply targeted fix, re-run
+   `tests/moe-offload/test-golden-logits.ps1` and update
+   `docs/moe-offload/README.md` Correctness section with measured
+   `max|?logit|`.
