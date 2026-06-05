@@ -4,11 +4,11 @@ The current target hardware is AMD HX 470 CPU + Nvidia 5070ti GPU. The GPU has 1
 
 ## First implementation - MVP verion:
 Use "MoE Infinity" as a base for implementation. Also consider FlashMoE for reference in model file cutting. Modify llama.cpp to achieve MoE Infinity similar functionalities. 
-- Seperate the model into non-expert weights and expert weight into different files to prepare for load-on-demand prefetch. Consider more fine-grained seperation like in FlashMoE if it has significant benefitss.
-- Maintain hot expert cache in GPU VRAM. Cold experts are offloaded to SSD. Include a new parameter to control how much experts is offloaded to SSD, i.e. how much VRAM is used.
+- Seperate the model into non-expert weights and expert weights into two different files to prepare for load-on-demand prefetch. Non-expert weights are loaded into VRAM upon launch. Expert weights are randomly loaded into VRAM at start,  given a parameter which controls the size of the expert cache. Then expert weights are pulled on-demand from cold storage (SSD) into VRAM based prefetch algorithm. Consider more fine-grained seperation like in FlashMoE if it has significant benefitss.
+- Maintain hot expert cache in GPU VRAM. Cold experts are offloaded to SSD. Include a new parameter to control how large the expert cache in VRAM is, i.e. how much VRAM is used for hot experts storage.
 - Use GPU for all calculation. Use GPU VRAM for KV-cache and attention weights. CPU DRAM is not used to store model weights. Offload and store KV-cache to SSD if necessary. 
-- Identify which parts of llama.cpp needs to be modified. Strive to make modifications in the form of extensions to llama.cpp or batches to llama.cpp, so that future llama.cpp community version updates can be merged into the local modified version without conflicts.
-- The implementation should be compatible to native llama.cpp supported functionalitie including but not limited to flash-attention etc.
+- Identify which parts of llama.cpp needs to be modified. Strive to make modifications in the form of extensions to llama.cpp or patches to llama.cpp, so that future llama.cpp community version updates can be merged into the local modified version without conflicts.
+- The implementation should be compatible to native llama.cpp supported functionalities including but not limited to flash-attention etc.
 - Write tests to make sure the modified code is correct and qwen3.5-35B-A3B model can be successfully run.
 - After testing is successfully done, deliver to me a readme on how to start model inference using the modified llama.cpp framework.
 
@@ -28,12 +28,12 @@ Main "MoE Infinity" first implementation architecture but improve the following 
 - Add an offline profiling phase such as in "Fiddler" or "DALI" or "PowerInfer" to identify hot experts to be loaded at initiation. 
 
 Additionally:
-- Thoroughly understand the paper "FineMoE". Incorporate granularity, prefetch policy, eviction policy, etc improvement in "FineMoE", which has stronger results compared with MoE-infinity.
+- Thoroughly understand the paper "FineMoE". Incorporate granularity, prefetch policy, eviction policy, etc, which has stronger results compared with MoE-infinity.
 - Thoroughly understand the paper "ADEPT" and Incoporate improvements made in "ADEPT".
 
 
 ## Third implementation areas to explore:
-Consider using model's internal represenation as prefetch prediction mechanism:
+Consider using model's internal represenation (or hidden states) as prefetch prediction mechanism:
 - "Fate" paper, using the previous layer's gate input (Gate_in_i) to predict which experts will be activated at the next layer
 - "YALIS" paper, uses internal model representations — specifically "quasi-hidden states" formed from the current residual stream and precomputed per-expert default vectors — to predict which experts the next layer's router will select
 
