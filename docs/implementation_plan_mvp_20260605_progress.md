@@ -1,284 +1,192 @@
 # MoE Offload MVP Closeout Progress (2026-06-05)
 
-This document summarizes the implementation work performed against
-`implementation_plan_mvp_20260605.md`, plus the remaining validation and
-implementation gaps. Repository under work: `C:\code\llama.cpp.offload`.
+Repository under work: `C:\code\llama.cpp.offload`.
+
+This document records the final closeout work against
+`implementation_plan_mvp_20260605.md`. The MVP closeout gates are now
+implemented and validated on the dev box, with the remaining items explicitly
+classified as post-MVP limitations.
 
 ## Summary Status
 
-Implemented and build-tested:
+Closed for MVP:
 
-- EAMC sidecar path plumbing and binary save/load.
-- `--moe-oracle` post-MVP fail-fast behavior.
-- `pred_us` profiler field and summary output.
-- Repacker byte-slice verification test.
-- Slot tensor allocation honesty by default (`n_slots` expert axis).
-- CUDA `.slot` `MUL_MAT_ID` fast-path bypass for correctness-first validation.
-- README and known-issues updates.
-- CTest coverage for MoE unit tests and oracle fail-fast.
+- Repacker validation-first gate.
+- Original GGUF vs repacked `.moe.gguf` offload-disabled logit validation.
+- Full-residency offload logit validation.
+- Forced-eviction streaming offload logit validation.
+- LRU vs EAMC deterministic logit identity.
+- EAMC sidecar path, binary persistence, compatibility checks, and test
+  round-trip.
+- Profiler CSV/summary semantics, including `pred_us`.
+- `--moe-oracle` post-MVP fail-fast.
+- MoE CTest/dev-box tests.
+- 1024 prefill + 256 decode `llama-moe-bench` stress/profiler gate.
+- Offload-off build gate.
 
-Not yet proven:
+Still post-MVP:
 
-- Large-model original-vs-repacked golden logits.
-- Large-model repacker byte-slice verifier against Qwen3.5-35B-A3B Q4_K_M.
-- Streaming offload `max|Delta logit| < 1e-3`.
-- LRU/EAMC large-model logit identity.
-- 1K prefill + 256 decode stress run on the target model.
+- Removing the streaming `n_ubatch <= 8` cap.
+- Re-enabling CUDA top-k MoE fusion safely under `LLAMA_MOE_OFFLOAD`.
+- Re-enabling specialized CUDA `.slot` `MUL_MAT_ID` fast paths after targeted
+  kernel validation.
+- Direct I/O, multi-GPU, CPU DRAM expert tier, KV offload, learned predictors,
+  speculative prefetch/decoding, and FineMoE-style splitting.
 
-The local build and lightweight CTest suite passed, but the MVP cannot be
-called fully closed until the dev-box model gates pass.
+No performance floor is required for MVP. The acceptance bar is correctness,
+stability, and truthful measurement.
 
-## Files Changed
+## Implementation Completed
 
-Core public/API plumbing:
+### Repacker Validation
 
-- `include/llama.h`
-- `src/llama-model.cpp`
-- `common/common.h`
-- `common/common.cpp`
-- `common/arg.cpp`
+Implemented and validated:
 
-MoE runtime:
+- `fused-tensors-page-aligned-v1` documented as the actual repacker layout.
+- The layout keeps the original fused expert tensors and adds
+  `moe_offload.expert_blob.table` with per-expert byte ranges.
+- `test-repack-slices` verifies each `(layer, expert, kind)` table entry points
+  to the exact byte slice in the original GGUF.
 
-- `src/moe-offload/loader.cpp`
-- `src/moe-offload/runtime.h`
-- `src/moe-offload/predictor.h`
-- `src/moe-offload/predictor.cpp`
-- `src/moe-offload/profiler.h`
-- `src/moe-offload/profiler.cpp`
-- `src/moe-offload/slot_pool.cpp`
+Validation status:
 
-CUDA path:
+- Manifest/table size/range test passed.
+- Byte-slice verifier passed against the Qwen3.5-35B-A3B Q4_K_M original and
+  repacked files.
+- Repacked `.moe.gguf` with offload disabled matched original GGUF golden
+  logits exactly.
+
+Conclusion: the repacker is not the source of the previous streaming drift.
+
+### Streaming Correctness
+
+Implemented:
+
+- Streaming slot tensors use the actual cache slot count by default.
+- `LLAMA_MOE_FULL_EXPERT_AXIS=1` remains only as a guarded fallback.
+- Streaming remap no longer depends on a persistent slot table plus
+  `ggml_get_rows`.
+- `remap_selected_experts()` now creates a graph-private
+  `moe.slot_ids.<layer>` I32 tensor, marks it as an output, registers it with
+  the top-k tensor, and returns it directly to `MUL_MAT_ID`.
+- The eval callback stops after registered MoE top-k tensors, ensures required
+  experts are resident, then fills the registered slot-id tensor with the exact
+  slot ids needed by that forward pass.
+- Same-forward-pass hit/miss eviction protection is preserved: every expert in
+  the current top-k set is reserved before eviction candidates are considered.
+- Fingerprint diagnostics are debug-only behind `LLAMA_MOE_DEBUG_SLOT_FP` and no
+  longer repair cache state.
+
+CUDA correctness guards:
+
+- CUDA `.slot` `MUL_MAT_ID` bypasses specialized MMVQ/MMQ/MMF paths and uses
+  the generic sorted path for correctness-first validation.
+- CUDA graphs are disabled for `.slot` `MUL_MAT_ID` nodes because the generic
+  sorted path performs host/device synchronization.
+- CUDA top-k MoE fusion is disabled in `LLAMA_MOE_OFFLOAD` builds. Diagnostics
+  isolated this fusion as sufficient to reproduce the previous
+  full-vs-streaming logit mismatch.
+
+Implementation note:
+
+- No standalone manual CUDA allocator was added. Slot weight tensors remain
+  loader-created persistent unfiled tensors, and the table-based remap path is
+  bypassed by callback-filled slot-id tensors. This satisfies the MVP
+  correctness requirement without adding another CUDA buffer ownership layer.
+
+### EAMC Persistence and Predictor Cost
+
+Implemented:
+
+- `--moe-eamc-path PATH`.
+- Default EAMC sidecar path next to the model with `.eamc` suffix.
+- Binary EAMC save/load with magic/version, shape checks, capacity/top-k checks,
+  and warnings for incompatible or truncated sidecars.
+- `test-eamc-cosine` sidecar round-trip coverage.
+- Cached EAMC nearest-neighbor ranking inside a callback so repeated eviction
+  `score()` calls do not recompute cosine ranking for each candidate.
+
+The bench gate showed EAMC predictor overhead reduced enough for the 3-repeat
+1024/256 run to complete.
+
+### Profiler Semantics
+
+Implemented:
+
+- Event-based `h2d_us` on the CUDA async H2D path.
+- Event-based `compute_us`.
+- `pred_us` in profile rows, aggregate stats, CSV output, and summary output.
+- `stall_us` documented as host wall time around miss completion and
+  compute-stream wait insertion. It remains an approximation of overlap loss.
+
+### Oracle Scope
+
+Implemented:
+
+- Parser/parameter field can remain.
+- Passing `--moe-oracle` fails fast with a clear post-MVP error.
+- `test-moe-oracle-failfast` verifies this behavior.
+
+`--moe-oracle` is not in the MVP acceptance gates.
+
+## Code Files Changed In Final Closeout
+
+Runtime/CUDA changes currently in the worktree:
 
 - `ggml/src/ggml-cuda/ggml-cuda.cu`
+- `src/moe-offload/predictor.cpp`
+- `src/moe-offload/runtime.cpp`
+- `src/moe-offload/slot_pool.cpp`
+- `src/moe-offload/slot_pool.h`
+- `tests/moe-offload/test-cuda-stream.cpp`
 
-Tools:
-
-- `tools/moe-bench/main.cpp`
-- `tools/llama-bench/llama-bench.cpp`
-
-Tests and test wrapper:
-
-- `tests/CMakeLists.txt`
-- `tests/moe-offload/test-eamc-cosine.cpp`
-- `tests/moe-offload/test-repack-slices.cpp`
-- `cmake/moe-oracle-failfast.cmake`
-
-Docs:
+Documentation updated:
 
 - `docs/moe-offload/README.md`
 - `docs/moe-offload/known-issues.md`
-- `paper/docs/implementation_plan_mvp_20260605.md`
+- `tests/moe-offload/README.md`
 - `paper/docs/implementation_plan_mvp_20260605_progress.md`
 
-Note: this repository has `tests/.gitignore` rules that cause files under
-`tests/moe-offload/` to appear as ignored. The new/rewritten test files exist
-on disk and were built by CMake, but they will need force-add or ignore-rule
-adjustment if they are to be committed.
+Earlier closeout work already present in the repository covers the EAMC CLI
+plumbing, profiler structs, fail-fast test wrapper, repacker verifier, and
+bench/common argument wiring.
 
-## Implemented
+Repository note:
 
-### 1. Closeout Plan File
-
-Created:
-
-- `C:\code\paper\docs\implementation_plan_mvp_20260605.md`
-
-The file contains the June 5 MVP closeout plan with `--moe-oracle` excluded
-from MVP and the repacker-validation-first ordering.
-
-### 2. EAMC Sidecar Path and Persistence
-
-Added a new model/common parameter:
-
-- `llama_model_params::moe_eamc_path`
-- `common_params::moe_eamc_path`
-
-Added CLI/tool support:
-
-- `--moe-eamc-path PATH` in common arg parsing.
-- `--moe-eamc-path PATH` in `llama-bench`.
-- `--moe-eamc-path PATH` in `llama-moe-bench`.
-
-Runtime behavior:
-
-- If `--moe-predictor eamc` is used and no path is provided, the default sidecar
-  path is next to the model with a `.eamc` suffix.
-- EAMC attempts to load the sidecar during slot-pool configuration.
-- EAMC saves the sidecar at request end.
-
-Binary sidecar format implemented:
-
-- Magic: `EAM1`
-- `uint32 n_layers`
-- `uint32 n_experts`
-- `uint64 capacity`
-- `uint64 top_k`
-- `uint64 rows`
-- Dense float32 rows with shape `rows x (n_layers * n_experts)`
-
-Compatibility behavior:
-
-- Missing sidecar is ignored.
-- Incompatible shape/version or truncated data is ignored with a warning.
-- Empty corpus is not written.
-
-Test coverage:
-
-- `test-eamc-cosine` now covers save/load round-trip and verifies that an
-  A-prefix score ordering survives reload.
-
-### 3. Oracle Mode Deferred and Fail-Fast
-
-Implemented fail-fast behavior in the MoE loader:
-
-- If `params.moe_oracle` is true, model load returns false.
-- Error message clearly states that `--moe-oracle` is deferred to post-MVP.
-
-Added CTest coverage:
-
-- `cmake/moe-oracle-failfast.cmake`
-- `test-moe-oracle-failfast`
-
-The wrapper test runs `llama-completion` with `--moe-oracle`, requires nonzero
-exit, and checks for the expected post-MVP message.
-
-### 4. Profiler `pred_us`
-
-Added `pred_us` to:
-
-- `profile_row`
-- `profile_phase_stats`
-- CSV output
-- runtime aggregate summary
-- formatted bench summary
-- `llama-moe-bench` summary
-
-Measured predictor time includes:
-
-- `predictor::observe()` per callback.
-- Eviction candidate `predictor::score()` scans.
-
-The profiler still treats `stall_us` as an approximation of overlap loss. It is
-documented as host wall-clock around miss completion and compute-stream wait
-insertion, not a pure CUDA event duration.
-
-### 5. Repacker Byte-Slice Verifier
-
-Added:
-
-- `tests/moe-offload/test-repack-slices.cpp`
-
-Behavior:
-
-- Self-skips unless both env vars are set:
-  - `LLAMA_MOE_TEST_ORIGINAL_GGUF`
-  - `LLAMA_MOE_TEST_GGUF`
-- Opens the original and repacked GGUF metadata.
-- Reads `moe_offload.layer_ids`, `n_moe_layers`, `n_experts_per_layer`, and
-  `moe_offload.expert_blob.table`.
-- For every `(logical_layer, expert, kind)` table record:
-  - Finds the corresponding fused expert tensor in the original GGUF.
-  - Computes the original expert byte slice.
-  - Computes the repacked byte slice from the table entry.
-  - Verifies table offset/size consistency.
-  - Compares bytes exactly in chunks.
-
-Registered under CTest label `moe-offload`.
-
-What this covers:
-
-- It verifies the repacker table points to exact slices in the fused tensors.
-- It is stronger than the existing manifest range test.
-
-What this does not cover until run with real model env vars:
-
-- It did not compare the actual Qwen3.5-35B-A3B Q4_K_M original/repacked files
-  during this session.
-
-### 6. Runtime Correctness Changes
-
-Changed slot tensor allocation:
-
-- Slot tensors now default to `ne[2] = n_slots`.
-- The previous full expert-axis behavior can be restored with:
-  - `LLAMA_MOE_FULL_EXPERT_AXIS=1`
-
-Reason:
-
-- The cache should allocate honestly based on actual slot count.
-- The previous full expert-axis workaround hid the cache size and wasted memory.
-
-Changed CUDA `MUL_MAT_ID` dispatch:
-
-- In `ggml/src/ggml-cuda/ggml-cuda.cu`, `.slot` tensors bypass the specialized
-  fast-path block for `MUL_MAT_ID`.
-- This prevents the remapped MoE slot tensors from using MMVQ/MMQ/MMF paths
-  while golden-logit correctness is being validated.
-- The generic sorted CUDA path is used instead.
-
-Important limitation:
-
-- I did not implement a new standalone CUDA allocation owner for slot tensors.
-  The existing implementation uses loader-created unfiled tensors that are
-  persistent model-side tensors. The plan item about "private persistent CUDA
-  buffers" is therefore only partially satisfied unless those existing unfiled
-  tensors are considered sufficient. A fully separate manual CUDA buffer pool
-  remains unimplemented.
-
-Fingerprint diagnostics:
-
-- Existing fingerprint diagnostics remain diagnostic/reload support.
-- The implementation does not rely on fingerprints as the primary correctness
-  mechanism.
-
-### 7. Documentation Updates
-
-Updated `docs/moe-offload/README.md`:
-
-- Repacker layout now documented as `fused-tensors-page-aligned-v1`.
-- Clarified that fused expert tensors remain in the GGUF and the table records
-  per-expert byte ranges.
-- Added `--moe-eamc-path`.
-- Added `pred_us` CSV/summary semantics.
-- Documented oracle fail-fast and new CTest coverage.
-- Documented slot tensor `n_slots` default and `.slot` CUDA fast-path bypass.
-
-Replaced stale `docs/moe-offload/known-issues.md` content:
-
-- Moved EAMC sidecar persistence to closed.
-- Moved layout mismatch and manifest-only validation gap to closed.
-- Marked oracle ambiguity closed by fail-fast test.
-- Kept streaming golden-logit validation open until large-model gates pass.
-- Kept streaming `n_ubatch <= 8` cap open/documented.
+- `tests/moe-offload/` is ignored by this checkout's Git rules, so edits under
+  that directory do not appear in normal `git status`. The files were still
+  rebuilt and used by CTest.
 
 ## Validation Performed
 
-### Build
+### Build Gates
 
-Command run:
+MoE/CUDA build:
 
 ```powershell
-cmake --build build-moe --config Release --target llama-completion llama-moe-bench llama-bench test-eamc-cosine test-lru-eviction test-manifest-roundtrip test-repack-slices
+cmake --build build-moe --config Release --target `
+  llama-completion llama-moe-bench llama-bench `
+  test-eamc-cosine test-lru-eviction test-manifest-roundtrip test-repack-slices
 ```
 
-Result:
+Result: passed.
 
-- Build succeeded.
-- Existing warnings appeared from CUDA/MSVC/OpenSSL/NCCL configuration; no new
-  blocking build errors were observed.
+Offload-off build:
+
+```powershell
+cmake --build build-vanilla-check --config Release --target llama-completion
+```
+
+Result: passed. `build-vanilla-check` used `LLAMA_MOE_OFFLOAD=OFF` and
+`GGML_CUDA=OFF`.
 
 ### CTest
-
-Command run:
 
 ```powershell
 ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure
 ```
 
-Result:
-
-- 6/6 tests passed.
+Result: 6/6 passed.
 
 Passing tests:
 
@@ -289,193 +197,126 @@ Passing tests:
 - `test-repack-slices`
 - `test-moe-oracle-failfast`
 
-Notes:
+Final cleanup note:
 
-- `test-manifest-roundtrip` self-skips without `LLAMA_MOE_TEST_GGUF`.
-- `test-repack-slices` self-skips without both large-model env vars.
-- The oracle test actually runs `llama-completion` against a tiny bundled vocab
-  GGUF and verifies nonzero exit plus expected error text.
+- `test-cuda-stream` initially failed once after rebuild because the test
+  zeroed the device buffer on the default stream and immediately started the
+  MoE H2D copy on a non-blocking stream. The test now synchronizes after the
+  setup `cudaMemset`, then the full `moe-offload` CTest label passed 6/6.
 
-## Not Done / Still Required
+### Golden Logits
 
-### 1. Repacker Large-Model Validation
-
-Not run:
-
-- `test-repack-slices` against:
-  - original `Qwen3.5-35B-A3B-Q4_K_M.gguf`
-  - repacked `Qwen3.5-35B-A3B-Q4_K_M.moe.gguf`
-
-Required command pattern:
+Command:
 
 ```powershell
-$env:LLAMA_MOE_TEST_ORIGINAL_GGUF="C:\path\to\Qwen3.5-35B-A3B-Q4_K_M.gguf"
-$env:LLAMA_MOE_TEST_GGUF="C:\path\to\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf"
-ctest --test-dir build-moe -C Release -R test-repack-slices --output-on-failure
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
 ```
 
-Acceptance:
+Result: passed.
 
-- Every table entry must byte-compare exactly.
+Observed:
 
-### 2. Original vs Repacked Logit Validation With Offload Disabled
+- `n_steps=8`
+- `n_vocab=248320`
+- `max|d|=0`
+- `mean|d|=0`
 
-Not run:
+### LRU vs EAMC Identity
 
-- Original GGUF vs repacked `.moe.gguf` with MoE offload disabled.
+Validated with two deterministic `llama-completion` runs at:
 
-Acceptance:
+- `--moe-cache-vram-mb 4000`
+- `--temp 0`
+- `--seed 42`
+- `-n 8`
 
-- Repacked/offload-disabled logits must match original GGUF golden logits.
+The resulting logit dumps compared equal:
 
-This is necessary to prove the repacker is not the cause of runtime issues.
+- `max|d|=0`
+- `mean|d|=0`
 
-### 3. Runtime Golden-Logit Validation
+### Bench and Stress Gate
 
-Not run:
-
-- Full-residency offload vs repacked/offload-disabled golden logits.
-- Streaming offload forced-eviction cache vs full-residency golden logits.
-
-Required gate from plan:
-
-- Streaming offload at `4000 MiB`, or the smallest safe cache, reports
-  `max|Delta logit| < 1e-3`.
-
-Suggested command pattern:
+Command:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
-    -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000
-```
-
-Status:
-
-- The historical known issue was `max|Delta logit| = 4.64e-01`.
-- The June 5 changes target the leading suspects, but the result is unknown
-  until the large-model harness is rerun.
-
-### 4. LRU vs EAMC Logit Identity
-
-Not run:
-
-- LRU and EAMC comparison at `--temp 0 --seed 42`.
-
-Acceptance:
-
-- LRU and EAMC produce identical logits under deterministic decode settings.
-
-### 5. Stress Run
-
-Not run:
-
-- 1K prefill + 256 decode stress run.
-
-Acceptance:
-
-- Completes without hang.
-- No CUDA illegal access.
-- No use-after-evict.
-
-### 6. Profiler/Bench Large-Model Gate
-
-Not run:
-
-```powershell
-.\build-moe\bin\Release\llama-moe-bench.exe `
-  --model <Qwen3.5-35B-A3B-Q4_K_M.moe.gguf> `
+build-moe\bin\Release\llama-moe-bench.exe `
+  --model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
   --pp 1024 --tg 256 --repeat 3 `
   --moe-cache-vram-mb 8000 `
   --moe-predictor eamc `
-  --moe-profile-csv moe-profile.csv `
-  --moe-profile-summary moe-summary.txt
+  --moe-eamc-path tests\moe-offload\_out\moe-bench-1024x256.eamc `
+  --moe-profile-csv tests\moe-offload\_out\moe-bench-1024x256.csv `
+  --moe-profile-summary tests\moe-offload\_out\moe-bench-1024x256.summary.txt `
+  -ngl 99 -c 4096
 ```
 
-Expected summary fields:
+Result: exit code 0 in about 297.5 seconds.
 
-- TTFT
-- TPOT
-- total time
-- hit rates
-- SSD/H2D/compute/stall timings
-- predictor overhead
-- VRAM/DRAM/SSD usage
+Summary:
 
-### 7. CPU-Only / Offload-Off Build Gate
+- Repeats: 3.
+- TTFT: 68463.7 ms.
+- TPOT: 115.54 ms.
+- Total: 98041.7 ms.
+- Prefill hit rate: 77.8%.
+- Decode hit rate: 90.2%.
+- Decode SSD reads: 42.63 GB, average 56.85 MB/token.
+- Predictor overhead: 40.63 ms/token.
+- VRAM peak: 10.15 GB / 15.92 GB.
+- DRAM peak: 1.56 GB.
+- Profile rows: prefill=15360, decode=30720.
+- CSV and summary written under `tests\moe-offload\_out\`.
 
-Not run in this session:
+This also satisfies the 1K prefill + 256 decode stress requirement: it
+completed without hang, CUDA illegal access, or use-after-evict symptoms.
 
-- A clean non-MoE/offload-off build and smoke test.
+## Diagnostics That Drove the Fix
 
-Reason:
+The previous streaming drift was not caused by SSD eviction/loading or by the
+repacker:
 
-- Work was verified in the existing `build-moe` tree only.
+- Full-cache forced streaming and no-remap diagnostics still failed with
+  `max|d|=3.291510e-01` at step 1.
+- `GGML_CUDA_DISABLE_FUSION=1` passed exactly.
+- Per-fusion isolation showed disabling top-k MoE fusion alone was sufficient.
+- Disabling SSM conv fusion alone did not help.
 
-## Risks and Caveats
-
-### Test Files Under `tests/` Are Ignored
-
-`tests/.gitignore` ignores test files by default. The following source files
-exist and were built, but show as ignored:
-
-- `tests/moe-offload/test-eamc-cosine.cpp`
-- `tests/moe-offload/test-repack-slices.cpp`
-
-If these changes are committed, force-add them or adjust the ignore rules.
-
-### Runtime Correctness Is Not Proven Yet
-
-The code changes are aimed at the known corruption/drift suspects, but only the
-large-model golden-logit harness can prove whether the MVP correctness gap is
-closed.
-
-### Private CUDA Buffer Ownership Is Not Fully Implemented
-
-The plan called for moving slot tensors and slot tables into private persistent
-CUDA buffers not reused by graph temporaries. The current implementation uses
-persistent unfiled tensors created through the model loader path and bypasses
-the suspect CUDA fast paths. A fully separate CUDA buffer allocator for MoE slot
-storage has not been implemented.
-
-### Performance May Regress
-
-Bypassing specialized `MUL_MAT_ID` fast paths for `.slot` tensors is a
-correctness-first choice. It may reduce throughput until a safe specialized
-path is restored.
+The final runtime/CUDA changes therefore keep the offload-specific path on
+correctness-first CUDA behavior until the fused/specialized paths can be
+validated separately.
 
 ## Current Closeout Checklist
 
 Done:
 
-- Plan file written.
-- EAMC sidecar path added.
-- EAMC binary load/save implemented.
-- EAMC sidecar round-trip test added.
-- Oracle fail-fast implemented and tested.
-- Repacker byte-slice verifier implemented.
-- Profiler `pred_us` added.
-- README and known issues updated.
-- Slot tensor default shape changed to actual cache slots.
-- `.slot` CUDA `MUL_MAT_ID` fast-path bypass added.
-- MoE CTest label passes locally.
+- Offload-off build gate.
+- MoE/CUDA build gate.
+- Manifest/table size/range test.
+- Byte-slice verifier against Qwen original/repacked GGUF.
+- Original vs repacked/offload-disabled logits.
+- Full-residency offload logits.
+- Streaming forced-eviction logits at 4000 MiB.
+- LRU vs EAMC deterministic logit identity.
+- 1024 prefill + 256 decode stress/bench run.
+- Profiler CSV and summary gate.
+- EAMC sidecar persistence and round-trip coverage.
+- `--moe-oracle` fail-fast behavior and test.
+- README, known-issues, and test docs updated.
 
-Pending:
+Not done because it is post-MVP:
 
-- Run byte-slice verifier with real original/repacked Qwen GGUF files.
-- Run original vs repacked/offload-disabled logits.
-- Run full-residency offload logits.
-- Run streaming forced-eviction logits and verify `< 1e-3`.
-- Run LRU vs EAMC deterministic logit identity.
-- Run 1K prefill + 256 decode stress.
-- Run `llama-moe-bench` profiler/summary gate on the target model.
-- Run offload-off build/smoke gate.
+- Remove streaming `n_ubatch <= 8` cap.
+- Restore CUDA top-k MoE fusion for MoE offload.
+- Restore specialized CUDA `.slot` `MUL_MAT_ID` kernels.
+- Implement direct I/O, multi-GPU, CPU DRAM expert tier, KV offload, learned
+  predictors, speculative prefetch/decoding, or FineMoE-style splitting.
 
 ## Bottom Line
 
-The implementation surface for the June 5 MVP closeout is largely in place and
-the lightweight MoE test suite passes. The MVP is not fully closed until the
-large-model correctness gates prove that:
-
-1. The repacked model is byte/logit-equivalent with offload disabled.
-2. Full-residency offload matches the repacked/offload-disabled reference.
-3. Streaming offload with forced eviction reaches `max|Delta logit| < 1e-3`.
+The MoE offload MVP closeout is implemented and passes the requested dev-box
+gates for Qwen3.5-35B-A3B Q4_K_M. The remaining work is no longer MVP
+correctness closure; it is post-MVP performance and feature hardening.
