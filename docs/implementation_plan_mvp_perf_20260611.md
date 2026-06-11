@@ -277,6 +277,11 @@ unattributed_decode_us
 
 ## Phase B - Keep EAMC Online, Defer Persistence
 
+Status: implemented and validated on 2026-06-11. The 8000 MiB EAMC benchmark
+improved decode TPOT from 7184.84 ms/token to 162.66 ms/token, with
+`predictor_save_us=0` and `sidecar_write_bytes=0` on all per-token decode
+request rows. One sidecar save occurred at benchmark end.
+
 EAMC should keep updating online during inference so it can preserve any cache
 hit-rate benefit from recent expert-activation history. The performance bug is
 that online update, corpus eviction, and persistent sidecar save are currently
@@ -355,8 +360,9 @@ bool llama_moe::flush_predictor();
 
 ## Phase C - Optimize EAMC Scoring
 
-After Phase B, EAMC still costs about 133.61 ms/token in the visible CSV. Make
-it cheap enough to be a real predictor option.
+After Phase B, EAMC scoring still costs about 90.54 ms/token in the 8000 MiB,
+256 prompt, 256 decode benchmark. Make it cheap enough to be a real predictor
+option.
 
 ### Changes
 
