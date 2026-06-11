@@ -69,7 +69,7 @@ target, not noise.
 
 ## Diagnosis
 
-### 1. EAMC Online Update Is the First Decode Bottleneck
+### 1. EAMC Finalization and Persistence Are the First Decode Bottleneck
 
 The current run used `--moe-predictor eamc` with the default sidecar:
 
@@ -209,7 +209,8 @@ and golden-logit gates before changing the `llama-cli` default.
 
 ## Goals
 
-1. Remove hidden per-token EAMC training and sidecar-save cost from inference.
+1. Remove hidden per-token EAMC persistence and expensive full-corpus eviction
+   cost from inference while keeping online EAMC updates.
 2. Make the profiler account for predictor finalization, sidecar writes, and
    unattributed wall time.
 3. Reduce EAMC scoring overhead enough that it can be compared fairly with
@@ -274,60 +275,83 @@ unattributed_decode_us
 - CSV rows can be grouped by benchmark repeat without inferring from
   `token_idx`.
 
-## Phase B - Make EAMC Read-Only by Default
+## Phase B - Keep EAMC Online, Defer Persistence
 
-The fastest safe fix is to stop mutating and saving EAMC during normal
-inference.
+EAMC should keep updating online during inference so it can preserve any cache
+hit-rate benefit from recent expert-activation history. The performance bug is
+that online update, corpus eviction, and persistent sidecar save are currently
+all tied to the per-token hot path. Phase B separates those concerns:
+
+- update EAMC in DRAM during inference,
+- use cheap bounded in-memory corpus management,
+- save the sidecar only at logical user request end or session/context end,
+- never rewrite the sidecar after every generated token.
 
 ### Changes
 
 1. Add a predictor lifecycle call from `llama_moe::begin_request()` into the
-   slot pool so predictor state is reset per `llama_decode()` batch when
-   training is enabled.
+   slot pool so EAMC's current activation row is reset at the start of each
+   `llama_decode()` request. This fixes the current lifecycle bug where the
+   row can accumulate across batches.
 
-2. Split EAMC operation into explicit modes:
-   - `eamc-readonly`: load sidecar, use it for scoring, do not append rows,
-     do not evict rows, do not save per token.
-   - `eamc-train`: append rows and save, intended for offline profiling or
-     explicit training runs only.
-   - `lru`: unchanged.
-
-   If CLI churn should be minimized, keep `--moe-predictor eamc` and add:
-
-```text
---moe-eamc-update off|on
---moe-eamc-save-interval N
-```
-
-Default should be `off` for `llama-cli`, `llama-completion`, `llama-bench`,
-and `llama-moe-bench`.
+2. Keep `--moe-predictor eamc` semantically online:
+   - loaded sidecar rows are available for scoring,
+   - new request rows are appended to an in-memory corpus,
+   - current-request observations can influence later eviction decisions,
+   - no user-facing read-only/update mode is added in this phase.
 
 3. Stop saving the EAMC sidecar from every `slot_pool_end_request()`.
-   Save only:
-   - at context teardown,
-   - at explicit benchmark/training end, or
-   - every `N` requests when the user opted into training.
+   Replace it with an explicit flush point:
+   - `llama-moe-bench` flushes once after all measured repeats complete,
+   - normal runtime flushes when the context/session is destroyed,
+   - server/chat integrations can call the same flush helper at logical user
+     request end if they want persistence before session teardown.
 
-4. Replace online `evict_redundant()` with an O(1) or O(capacity) policy for
-   training mode:
-   - FIFO ring buffer is acceptable for the first performance fix.
-   - Keep expensive redundancy pruning as an offline compaction tool, not in
-     the decode path.
+   In this phase, "request end" means the end of a logical generation/chat
+   request, not the end of each internal `llama_decode()` batch.
 
-5. Add tests:
-   - loaded full-capacity sidecar plus 2 decode requests does not change file
-     mtime in read-only mode.
-   - read-only mode does not grow or evict corpus rows.
-   - train mode calls `begin_request()` and clears current activation state.
-   - train mode save interval is honored.
+4. Add a narrow API:
+
+```cpp
+bool llama_moe::flush_predictor();
+```
+
+   Behavior:
+   - no-op for LRU,
+   - for EAMC, save the current in-memory corpus to `opts.eamc_path`,
+   - return success/failure so benchmark tools can report save errors.
+
+5. Replace online `evict_redundant()` with a cheap bounded policy:
+   - use FIFO/ring replacement when corpus capacity is full,
+   - keep the dense sidecar file format initially for compatibility,
+   - move expensive redundancy pruning to a future offline compaction tool.
+
+6. Keep Phase A request metrics:
+   - `predictor_end_us` should include cheap in-memory row append only,
+   - `predictor_save_us` should be zero for per-token decode requests,
+   - sidecar bytes should be written only at explicit flush.
+
+7. Add tests:
+   - EAMC appends online rows in memory across decode requests.
+   - Full-capacity EAMC uses ring/FIFO replacement without O(capacity^2)
+     redundancy pruning.
+   - A decode request with `--moe-predictor eamc --moe-eamc-path PATH` does
+     not change `PATH` mtime.
+   - `flush_predictor()` writes `PATH` and updates its mtime.
+   - `llama-moe-bench` saves EAMC once at benchmark end when an EAMC path is
+     configured.
 
 ### Acceptance
 
 - With the same 8000 MiB cache and sidecar, decode TPOT drops from seconds per
   token to the range explained by per-layer CSV timers.
-- Sidecar file mtime is unchanged after read-only inference.
-- `predictor_end_us` and `predictor_save_us` are near zero in read-only mode.
-- LRU and EAMC read-only can be compared without hidden training cost.
+- Sidecar file mtime is unchanged during token generation and changes only at
+  explicit flush/session end.
+- `predictor_save_us` is zero on per-token decode request rows.
+- `predictor_end_us` is bounded and no longer runs O(capacity^2) redundancy
+  pruning.
+- EAMC hit rate is compared before/after Phase B to verify that online DRAM
+  updates preserve or improve cache behavior.
 
 ## Phase C - Optimize EAMC Scoring
 
@@ -367,7 +391,7 @@ Eviction scans then read `score_for_expert[exp]` in O(1).
 
 ### Acceptance
 
-- EAMC read-only predictor row time is below 10 ms/token on the 8000 MiB,
+- EAMC online predictor row time is below 10 ms/token on the 8000 MiB,
   256 prompt, 256 decode benchmark.
 - EAMC hit rate and TPOT are compared against LRU on identical cache/reset
   settings.
@@ -540,7 +564,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-llama
 
 ### Performance
 
-Run LRU and EAMC read-only with identical settings. The commands below use
+Run LRU and EAMC online deferred-save with identical settings. The commands
+below use
 `llama-moe-bench` because it is the most controlled MoE-specific benchmark
 surface; the same profiler fields and diagnosis apply to `llama-bench` runs
 that emit `moe-profile.csv`.
@@ -563,8 +588,8 @@ that emit `moe-profile.csv`.
   --moe-cache-vram-mb 8000 `
   --moe-predictor eamc `
   --moe-eamc-path C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.eamc `
-  --moe-profile-csv tests\moe-offload\_out\perf-eamc-readonly-8gb.csv `
-  --moe-profile-summary tests\moe-offload\_out\perf-eamc-readonly-8gb.summary.txt `
+  --moe-profile-csv tests\moe-offload\_out\perf-eamc-online-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\perf-eamc-online-8gb.summary.txt `
   -ngl 99 -c 4096 -ub 512
 ```
 
@@ -589,7 +614,7 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
 ## Recommended Order
 
 1. Phase A: add missing profiler buckets.
-2. Phase B: make EAMC read-only by default and remove per-token sidecar save.
+2. Phase B: keep EAMC online in memory and remove per-token sidecar save.
 3. Run an LRU baseline immediately after Phase B.
 4. Phase C: optimize EAMC scoring only if EAMC still looks useful versus LRU.
 5. Phase D: fix H2D buffer lifetime to recover overlap.

@@ -7,6 +7,11 @@ This records the Phase A implementation from
 made: EAMC still updates and saves exactly as before, now with timing around
 that path.
 
+Phase B direction was clarified after Phase A: EAMC should remain an online
+predictor during normal inference, with updates kept in DRAM. The sidecar
+should be saved only at logical user request end or session/context end, not
+after every internal `llama_decode()` batch.
+
 ## Scope Completed
 
 Implemented Phase A profiler and benchmark calibration infrastructure:
@@ -165,8 +170,9 @@ Passing tests:
 
 The following Phase B+ items were intentionally not implemented:
 
-- EAMC read-only mode.
-- Disabling per-token EAMC sidecar saves.
+- Online EAMC update with deferred sidecar save.
+- Removing per-token EAMC sidecar saves.
+- EAMC flush at logical user request end or session/context end.
 - EAMC scoring optimization.
 - H2D buffer lifetime changes.
 - CUDA `.slot` `MUL_MAT_ID` fast-path restoration.
