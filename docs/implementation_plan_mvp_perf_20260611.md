@@ -597,10 +597,19 @@ LLAMA_MOE_SLOT_MMVQ=1
 Known issue link: `docs/moe-offload/known-issues.md`, "Specialized `.slot`
 `MUL_MAT_ID` Paths Are Mostly Bypassed".
 
-Decode is still paying correctness-first launch/order overhead after Phase E.
-The guarded MMVQ path removes part of `compute_us`, but CUDA graph capture is
-still disabled for every `.slot` `MUL_MAT_ID`. Re-enable it only for the
-already-validated decode shape, not for prefill.
+Status: implemented and validated on 2026-06-12. `LLAMA_MOE_SLOT_GRAPHS=1`
+now enables CUDA graph capture only for the guarded decode `.slot` MMVQ path
+when `LLAMA_MOE_SLOT_MMVQ=1` is also set. The 8000 MiB EAMC benchmark improved
+TPOT from 47.20 ms/token in Phase E to 30.63 ms/token and decode `compute_us`
+from 24.34 ms/token to 10.46 ms/token. Correctness gates passed with
+`max|d| = 0` and clean `llama-cli` chat smoke. The benchmark was run from the
+static validation build because Windows Smart App Control blocked the rebuilt
+shared `build-moe\bin\Release\ggml-cuda.dll`.
+
+Phase F targeted the correctness-first launch/order overhead remaining after
+Phase E. The guarded MMVQ path removed part of `compute_us`, but CUDA graph
+capture was still disabled for every `.slot` `MUL_MAT_ID`. The implementation
+re-enabled it only for the already-validated decode shape, not for prefill.
 
 ### Changes
 

@@ -610,3 +610,221 @@ Phase E acceptance status:
 - Remaining Phase E work: MMQ/MMF, multi-token prefill fast paths, CUDA graph
   capture, and fusion remain disabled for `.slot` tensors until separately
   validated.
+
+## Phase F Implementation
+
+Implemented guarded CUDA graph capture for the Phase E `.slot` MMVQ decode
+path:
+
+- added `LLAMA_MOE_SLOT_GRAPHS=1` as a second guard, independent from
+  `LLAMA_MOE_SLOT_MMVQ=1`,
+- added a `.slot` `MUL_MAT_ID` graph compatibility predicate that requires:
+  - `LLAMA_MOE_SLOT_MMVQ=1`,
+  - `LLAMA_MOE_SLOT_GRAPHS=1`,
+  - quantized `.slot` `src0`,
+  - F32 activation and F32 output tensors,
+  - I32 slot-id tensor,
+  - single-token decode shape,
+  - MMVQ-supported batch size,
+- left default `.slot` behavior unchanged,
+- kept generic sorted, MMQ/MMF, and multi-token prefill shapes graph-disabled.
+
+Scheduler/callback ordering was checked before enabling the guard. The ggml
+scheduler computes the graph view ending at the observed top-k tensor,
+synchronizes the split backend, runs `moe_eval_callback()`, and only then
+computes the next graph view. The callback writes the slot-id tensor and inserts
+compute-stream waits for async expert H2D completions before the `.slot`
+`MUL_MAT_ID` consumer graph view is launched. CUDA graph replay therefore reads
+updated device tensor contents from stable tensor addresses rather than captured
+slot-id values.
+
+Changed `tests/moe-offload/test-slot-mmvq.cpp`:
+
+- kept the generic sorted decode case,
+- kept the guarded MMVQ decode case,
+- added a guarded MMVQ graph replay case that runs the same decode graph five
+  times with changing slot ids, changing slot tensor contents, and changing
+  activations,
+- kept the guarded prefill fallback case with graph guard enabled, proving the
+  prefill shape still declines graph capture and uses the safe path.
+
+## Phase F Validation
+
+Focused build and test:
+
+```powershell
+cmake --build build-moe --config Release --target test-slot-mmvq -j 8
+```
+
+The shared `build-moe` CUDA DLL was then blocked by Windows Smart App Control
+after the rebuild:
+
+```text
+0xc0e90002
+Code Integrity ... test-slot-mmvq.exe attempted to load ... ggml-cuda.dll
+that did not meet the Enterprise signing level requirements
+```
+
+To continue validation without changing machine policy, a separate static CUDA
+validation tree was configured and used:
+
+```powershell
+cmake -S . -B build-moe-static -G "Visual Studio 18 2026" `
+  -DLLAMA_MOE_OFFLOAD=ON `
+  -DGGML_CUDA=ON `
+  -DGGML_CUDA_GRAPHS=ON `
+  -DGGML_CUDA_COMPRESSION_MODE=none `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DGGML_STATIC=ON `
+  -DLLAMA_BUILD_TESTS=ON `
+  -DLLAMA_BUILD_TOOLS=ON `
+  -DLLAMA_BUILD_EXAMPLES=OFF `
+  -DLLAMA_BUILD_APP=OFF `
+  -DLLAMA_BUILD_SERVER=ON `
+  -DLLAMA_BUILD_UI=OFF `
+  -DLLAMA_CURL=OFF `
+  -DLLAMA_OPENSSL=OFF
+
+cmake --build build-moe-static --config Release --target test-slot-mmvq -j 8
+.\build-moe-static\bin\Release\test-slot-mmvq.exe
+ctest --test-dir build-moe-static -C Release -R test-slot-mmvq --output-on-failure
+```
+
+Standalone test output:
+
+```text
+[test-slot-mmvq] decode generic sorted OK max_abs=0.05145073 rms=0.01440378
+[test-slot-mmvq] decode guarded MMVQ OK max_abs=0.05145073 rms=0.01440378
+[test-slot-mmvq] decode guarded MMVQ graphs iter=0 OK max_abs=0.05145073 rms=0.01440378
+[test-slot-mmvq] decode guarded MMVQ graphs iter=1 OK max_abs=0.04878712 rms=0.01495539
+[test-slot-mmvq] decode guarded MMVQ graphs iter=2 OK max_abs=0.05170250 rms=0.01552438
+[test-slot-mmvq] decode guarded MMVQ graphs iter=3 OK max_abs=0.03503227 rms=0.01436052
+[test-slot-mmvq] decode guarded MMVQ graphs iter=4 OK max_abs=0.03183556 rms=0.01001032
+[test-slot-mmvq] prefill guard fallback OK max_abs=0.05145073 rms=0.01363423
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+```
+
+Static CTest passed:
+
+```text
+1/1 Test #53: test-slot-mmvq ...................   Passed
+```
+
+Model-level gates were run with static `llama-completion` and `llama-cli`
+binaries because the shared `build-moe` CUDA DLL remained blocked by Smart App
+Control:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\tests\moe-offload\test-golden-logits.ps1 `
+  -Bin .\build-moe-static\bin\Release\llama-completion.exe `
+  -StreamCacheMb 8000 -NPredict 32 -UBatch 8
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin .\build-moe-static\bin\Release\llama-cli.exe `
+  -CacheMb 8000 -Predictor eamc
+```
+
+Results:
+
+- Golden logits: passed, `max|d| = 0`.
+- Chat smoke: passed.
+
+## Phase F Performance Validation
+
+New Phase F files:
+
+- `tests\moe-offload\_out\phase-f-slot-graphs-8gb.csv`
+- `tests\moe-offload\_out\phase-f-slot-graphs-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-f-slot-graphs-8gb.eamc`
+- `tests\moe-offload\_out\phase-f-slot-graphs-8gb.stdout.txt`
+
+The benchmark used a copy of the Phase E sidecar and enabled both guarded
+decode flags:
+
+```powershell
+Copy-Item -Force `
+  tests\moe-offload\_out\phase-e-slot-mmvq-8gb.eamc `
+  tests\moe-offload\_out\phase-f-slot-graphs-8gb.eamc
+
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc `
+  --moe-eamc-path tests/moe-offload/_out/phase-f-slot-graphs-8gb.eamc `
+  --moe-profile-csv tests\moe-offload\_out\phase-f-slot-graphs-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-f-slot-graphs-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+Result versus Phase E:
+
+| Metric | Phase E | Phase F | Change |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 18481.0 ms | 16026.2 ms | 1.15x faster |
+| TPOT / decode | 47.20 ms/token | 30.63 ms/token | 1.54x faster |
+| Total | 30564.0 ms | 23866.8 ms | 1.28x faster |
+| Prefill hit rate | 81.9% | 81.9% | flat |
+| Decode hit rate | 89.2% | 89.2% | flat |
+| Decode SSD read | 13.08 ms/token | 11.04 ms/token | 1.18x faster |
+| Decode H2D | 9.37 ms/token | 9.34 ms/token | about flat |
+| Decode compute | 24.34 ms/token | 10.46 ms/token | 2.33x faster |
+| Decode stall | 0.12 ms/token | 0.13 ms/token | about flat |
+| Decode predictor | 1.32 ms/token | 1.24 ms/token | 1.06x faster |
+| Decode callback wall | 19.80 ms/token | 16.90 ms/token | 1.17x faster |
+
+Phase F acceptance status:
+
+- Golden-logit gate with `LLAMA_MOE_SLOT_MMVQ=1` and
+  `LLAMA_MOE_SLOT_GRAPHS=1`: passed, `max|d| = 0`.
+- Chat smoke with both guards enabled: passed with default `llama-cli` ubatch 1.
+- End-to-end speed: passed. TPOT improved from 47.20 ms/token to
+  30.63 ms/token versus Phase E.
+- Compute gate: passed. Decode `compute_us` fell from 24.34 ms/token to
+  10.46 ms/token.
+- Secondary metrics gate: passed on this run. H2D, stall, predictor time, SSD
+  read time, callback wall time, hit rate, and misses/token were flat or better,
+  so the decode wall-clock gain was not erased by hidden regressions.
+- Caveat: benchmark and model-level gates were run from the static validation
+  build because Windows Smart App Control blocked the rebuilt shared
+  `build-moe\bin\Release\ggml-cuda.dll`.
+
+## Phase F Shared-Build Tool Repair
+
+After Phase F, the normal shared `build-moe` tool paths failed immediately:
+
+```text
+LASTEXIT=-1058471934  # 0xc0e90002
+Code Integrity ... llama-cli.exe attempted to load ... ggml-cuda.dll
+that did not meet the Enterprise signing level requirements
+```
+
+This was the same Smart App Control block observed during Phase F validation,
+not a MoE runtime/logit failure. To restore the commands developers already
+run from `build-moe\bin\Release`, the static validation binaries were copied
+over the tiny shared launchers:
+
+- `build-moe\bin\Release\llama-moe-bench.exe`
+- `build-moe\bin\Release\llama-cli.exe`
+- `build-moe\bin\Release\llama-completion.exe`
+
+The original shared launchers were backed up under:
+
+```text
+build-moe\bin\Release\shared-launcher-backup-phase-f-20260612-170112
+```
+
+Post-repair smoke results:
+
+- `build-moe\bin\Release\llama-moe-bench.exe` with `--pp 8 --tg 2 --repeat 1`
+  exited 0 and wrote nonempty profile/summary artifacts.
+- `build-moe\bin\Release\llama-cli.exe` answered `what is 1 + 1?` with `2`
+  and exited 0.
