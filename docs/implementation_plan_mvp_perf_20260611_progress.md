@@ -978,3 +978,205 @@ Phase G acceptance status:
   nonzero process code after repeated `get_logits_ith: invalid logits id 0`
   warnings. The summaries were still emitted successfully and are usable for
   timing comparison, but this bench exit-code issue remains separate cleanup.
+
+## Phase H Implementation
+
+Phase H fixed the top-k fusion correctness failure under an explicit diagnostic
+gate, but did not promote top-k fusion as a normal performance feature.
+
+Root cause:
+
+- In streaming mode the eval callback stopped the scheduler at
+  `ffn_moe_topk` so it could read selected expert IDs and load/remap slots.
+- CUDA top-k MoE fusion replaces the router segment through final routing
+  weights. Stopping at the top-k view split that fused segment at the wrong
+  boundary.
+- The fused router itself preserved the selected ID order in the focused
+  diagnostic test. The logit drift came from the callback/fusion boundary:
+  IDs and weights were not being produced as the same completed router segment
+  before slot loading.
+
+Code changes:
+
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+  - Added `LLAMA_MOE_TOPK_FUSION_DIAG=1`.
+  - Keeps normal `LLAMA_MOE_TOPK_FUSION=1` ignored in `LLAMA_MOE_OFFLOAD`
+    builds.
+  - Allows diagnostic top-k fusion only for single-token decode
+    (`ggml_nrows(logits) == 1`).
+
+- `src/llama-graph.cpp`
+  - Captures the original selected-expert top-k tensor.
+  - When `LLAMA_MOE_TOPK_FUSION_DIAG=1` and `n_tokens == 1`, registers the
+    final routing weights tensor as the eval-callback stop point while still
+    reading IDs from the original top-k tensor.
+
+- `src/moe-offload/slot_pool.{h,cpp}`
+  - Added `register_weights_for_topk()`.
+  - Added alternate callback mapping from final weights back to the original
+    top-k tensor.
+  - Suppresses the old top-k callback stop when an alternate weights callback
+    is registered.
+  - Reads strided top-k views with `ggml_backend_tensor_get_2d()` instead of
+    assuming contiguous storage.
+
+The strided top-k read fix is not limited to diagnostic fusion. It is on the
+normal callback path and explains the large Phase H prefill jump. In earlier
+prefill runs, the callback treated non-contiguous top-k views as compact
+storage, which inflated the apparent set of required experts. The Phase H
+baseline run has top-k fusion disabled and still gets the prefill win.
+
+- `tests/moe-offload/test-topk-moe-fusion.cpp`
+  - Added a CUDA diagnostic test for Qwen-style routing:
+    `softmax -> argsort_top_k -> get_rows -> norm -> scale`.
+  - Compares unfused and diagnostic-fused IDs/weights.
+  - Covers single-token decode and a multi-token fallback case.
+
+## Phase H Validation
+
+Focused build:
+
+```powershell
+cmake --build build-moe-static --config Release --target test-topk-moe-fusion test-slot-mmvq llama-completion llama-cli llama-moe-bench -j 8
+```
+
+CTest:
+
+```powershell
+ctest --test-dir build-moe-static -C Release -R "test-(topk-moe-fusion|slot-mmvq)" --output-on-failure
+```
+
+Result:
+
+```text
+test-topk-moe-fusion: passed
+test-slot-mmvq: passed
+```
+
+Direct diagnostic output:
+
+```text
+[test-topk-moe-fusion] decode qwen softmax norm scale OK max_abs=2.98023224e-08 rms=1.60230794e-08
+[test-topk-moe-fusion] prefill diagnostic fallback OK max_abs=0 rms=0
+```
+
+Golden-logit gates used the static validation build:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='0'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='0'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='1'
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests\moe-offload\test-golden-logits.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-completion.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
+```
+
+Results:
+
+- Top-k diagnostic alone: passed, `max|d| = 0`.
+- Top-k diagnostic + GLU fusion: passed, `max|d| = 0`.
+- Top-k diagnostic + GLU fusion + guarded graphs: passed, `max|d| = 0`.
+- `llama-cli` chat smoke with the full guarded stack: passed.
+
+Chat smoke command:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='1'
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-cli.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -CacheMb 8000 -Predictor lru -NPredict 64
+```
+
+## Phase H Performance Validation
+
+Artifacts:
+
+- `tests\moe-offload\_out\phase-h-baseline-8gb.csv`
+- `tests\moe-offload\_out\phase-h-baseline-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-h-baseline-8gb.eamc`
+- `tests\moe-offload\_out\phase-h-topk-8gb.csv`
+- `tests\moe-offload\_out\phase-h-topk-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-h-topk-8gb.eamc`
+
+The Phase H baseline and Phase H top-k runs used copies of the Phase F sidecar
+and the same static build. Baseline enabled the accepted Phase F/G guards; the
+Phase H run additionally enabled `LLAMA_MOE_TOPK_FUSION_DIAG=1`.
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='0' # baseline; set to 1 for Phase H run
+
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 --moe-predictor eamc `
+  --moe-eamc-path tests\moe-offload\_out\phase-h-baseline-8gb.eamc `
+  --moe-profile-csv tests\moe-offload\_out\phase-h-baseline-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-h-baseline-8gb.summary.txt
+```
+
+Result:
+
+| Metric | Phase G GLU | Phase H baseline | Phase H top-k diag |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 14021.9 ms | 5070.4 ms | 5199.6 ms |
+| Prefill hit rate | 81.9% | 85.4% | 86.0% |
+| Prefill required experts/callback | 64.0 | 20.7 | 20.7 |
+| Prefill misses | 44581 | 11610 | 11125 |
+| Prefill SSD read | 16799 ms | 4199 ms | 4461 ms |
+| Prefill H2D | 12010 ms | 3146 ms | 3006 ms |
+| Prefill compute | 17936 ms | 8315 ms | 8487 ms |
+| Prefill callback wall | 23467 ms | 6498 ms | 6610 ms |
+| TPOT / decode | 30.67 ms/token | 31.91 ms/token | 31.88 ms/token |
+| Total | 21873.7 ms | 13240.4 ms | 13361.0 ms |
+| Decode hit rate | 89.2% | 88.2% | 88.3% |
+| Decode SSD read | 11.03 ms/token | 11.98 ms/token | 12.44 ms/token |
+| Decode H2D | 9.34 ms/token | 10.29 ms/token | 10.12 ms/token |
+| Decode compute | 10.37 ms/token | 10.48 ms/token | 10.11 ms/token |
+| Decode stall | 0.14 ms/token | 0.15 ms/token | 0.15 ms/token |
+| Decode predictor | 1.31 ms/token | 1.07 ms/token | 1.02 ms/token |
+| Decode callback wall | 17.06 ms/token | 18.07 ms/token | 18.37 ms/token |
+| Decode top-k D2H | 1.57 ms/token | 1.58 ms/token | 1.58 ms/token |
+| Decode misses/token | 20.78 | 20.74 | 20.65 |
+
+Interpretation:
+
+- The prefill speedup is a default-path correctness/performance fix from
+  reading strided top-k views correctly, not a result of top-k fusion.
+- Phase H baseline, with diagnostic fusion disabled, already improves prefill
+  from 14021.9 ms to 5070.4 ms versus the Phase G GLU run.
+- Diagnostic top-k fusion is decode-only in this implementation. It is
+  correctness-clean, but it does not materially improve decode TPOT or
+  `topk_d2h_us` in this benchmark.
+
+Phase H acceptance status:
+
+- Root cause: documented and fixed under the diagnostic callback boundary.
+- Synthetic top-k IDs/weights: passed.
+- Golden logits with top-k alone: passed, `max|d| = 0`.
+- Golden logits with top-k + GLU + graphs: passed, `max|d| = 0`.
+- Chat smoke: passed.
+- Prefill speed: accepted for the default path. TTFT improved from 14021.9 ms
+  in Phase G GLU to 5070.4 ms in Phase H baseline because the callback no
+  longer overestimates required experts from strided top-k views.
+- Top-k fusion end-to-end speed: not accepted. Decode TPOT was effectively
+  flat (31.91 -> 31.88 ms/token), total wall time was slightly worse, and
+  `topk_d2h_us` stayed flat.
+- Secondary metrics: acceptable for correctness diagnostics. H2D, stall,
+  predictor, hit rate, and misses/token stayed within noise, while SSD and
+  callback wall time were slightly worse.
+- Default status: keep top-k fusion default-off and diagnostic-only through
+  `LLAMA_MOE_TOPK_FUSION_DIAG=1`.

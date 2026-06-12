@@ -655,35 +655,32 @@ LLAMA_MOE_SLOT_GRAPHS=1
   gain.
 - Any graph guard can be disabled independently from `LLAMA_MOE_SLOT_MMVQ`.
 
-## Phase G - Decode Top-k And MoE Fusion Revalidation
+## Phase G - Decode GLU Fusion Revalidation
 
-Known issue link: `docs/moe-offload/known-issues.md`, "CUDA Top-k MoE Fusion Is
-Disabled".
+Known issue link: `docs/moe-offload/known-issues.md`, "Specialized `.slot`
+`MUL_MAT_ID` Paths Are Mostly Bypassed".
 
-CUDA top-k MoE fusion was disabled because it was sufficient to reproduce the
-historical streaming logit drift. After the unfused guarded MMVQ decode path is
-correct, revalidate fusion as a decode-only optimization. Do not use this phase
-to fix batched prefill.
+After the guarded MMVQ decode path and graph capture are correct, revalidate
+the `.slot` GLU/MoE fusion around `MUL_MAT_ID` as a decode-only optimization.
+Do not use this phase to fix batched prefill or top-k MoE fusion.
 
 ### Changes
 
 1. Inventory currently disabled CUDA fusion points in `LLAMA_MOE_OFFLOAD`:
-   - top-k MoE fusion,
    - GLU/MoE fusion around `MUL_MAT_ID`,
    - any fused mul-mat-vector path currently excluded for `.slot`.
 
-2. Add independent fusion guards so each path can be isolated:
+2. Add an independent GLU fusion guard so it can be isolated:
 
 ```text
 LLAMA_MOE_SLOT_GLU_FUSION=1
-LLAMA_MOE_TOPK_FUSION=1
 ```
 
-3. Validate one fusion at a time on decode shape:
+3. Validate GLU fusion on decode shape:
    - start from Phase E guarded MMVQ,
    - run synthetic CUDA tests with changing slot ids and slot contents,
-   - run golden logits after each fusion is enabled,
-   - run chat smoke after each fusion is enabled.
+   - run golden logits with GLU fusion enabled,
+   - run chat smoke with GLU fusion enabled.
 
 4. Keep the default off until a full decode validation matrix passes.
 
@@ -693,9 +690,8 @@ LLAMA_MOE_TOPK_FUSION=1
 6. Phase G implementation result:
    - accepted `LLAMA_MOE_SLOT_GLU_FUSION=1` for quantized `.slot`
      single-token `MUL_MAT_ID + GLU` decode only,
-   - kept top-k MoE fusion disabled in `LLAMA_MOE_OFFLOAD` builds because
-     the guarded single-row decode revalidation still failed golden logits,
-   - left multi-token/prefill fusion work for Phase H or later.
+   - kept top-k MoE fusion out of scope and moved it to Phase H,
+   - left multi-token/prefill fusion work for Phase I or later.
 
 ### Acceptance
 
@@ -712,7 +708,148 @@ LLAMA_MOE_TOPK_FUSION=1
   predictor time, SSD read time, hit rate, and misses/token.
 - Any fusion guard can be disabled independently if a model or shape regresses.
 
-## Phase H - Prefill-Specific Improvements
+## Phase H - CUDA Top-k MoE Fusion Correctness And Decode Revalidation
+
+Known issue link: `docs/moe-offload/known-issues.md`, "CUDA Top-k MoE Fusion Is
+Disabled".
+
+Treat top-k MoE fusion as a separate high-risk correctness issue, not as a
+minor follow-up to GLU fusion. It was historically sufficient to reproduce
+streaming logit drift, and Phase G's attempted single-row decode revalidation
+still failed the golden-logit gate with `max|d| = 4.639292e-01`. Do not enable
+this path for normal `LLAMA_MOE_OFFLOAD` runs until the routing and logit drift
+are explained and fixed.
+
+### Changes
+
+1. Keep top-k MoE fusion hard-disabled for `LLAMA_MOE_OFFLOAD` by default.
+   `LLAMA_MOE_TOPK_FUSION=1` may exist only as an explicit experimental
+   diagnostic once the phase starts; it must not silently affect normal runs.
+
+2. Build a routing-level diagnostic harness before changing the fused kernel:
+   - dump/log unfused router logits, selected ids, and selected weights for a
+     small decode run,
+   - dump/log the same tensors from the fused top-k path,
+   - compare full-residency versus streaming,
+   - compare unfused versus fused with identical slot-table and slot-id inputs,
+   - include tie/NaN/bias/norm/scale cases that the existing CUDA top-k matcher
+     supports.
+
+3. Isolate where drift enters:
+   - top-k ids differ,
+   - top-k weights differ,
+   - ids/weights are correct but downstream slot remap consumes stale or
+     inconsistent routing state,
+   - CUDA graph capture/replay changes the observed tensors,
+   - fusion memory aliasing overwrites inputs or intermediates.
+
+4. Add focused tests before enabling the path:
+   - synthetic CUDA top-k fusion test with stable expected ids/weights,
+   - streaming slot-table remap test with changing selected experts,
+   - golden logits with `LLAMA_MOE_TOPK_FUSION=1` and GLU fusion disabled,
+   - golden logits with top-k + GLU fusion combined only after each passes
+     independently,
+   - chat smoke after top-k passes golden logits.
+
+5. Keep prefill/multi-token top-k fusion out of this phase unless decode is
+   already correct. If decode and prefill share the same matcher, explicitly
+   guard decode-only shapes and leave multi-token shapes disabled.
+
+6. Once correctness passes, measure decode performance against the Phase G GLU
+   baseline:
+   - TPOT,
+   - `topk_d2h_us`,
+   - callback wall time,
+   - `compute_us`,
+   - h2d/stall/predictor/SSD/hit-rate/misses-token secondary metrics.
+
+7. Phase H implementation result:
+   - added an opt-in diagnostic gate, `LLAMA_MOE_TOPK_FUSION_DIAG=1`, while
+     leaving normal `LLAMA_MOE_TOPK_FUSION=1` ineffective for
+     `LLAMA_MOE_OFFLOAD` builds,
+   - constrained the diagnostic fused top-k path to single-token decode
+     shapes,
+   - moved the streaming callback boundary from the selected top-k tensor to
+     the final routing-weights tensor for the diagnostic path, while still
+     reading expert IDs from the original top-k tensor,
+   - fixed callback reads of strided top-k views with
+     `ggml_backend_tensor_get_2d()`,
+   - added `test-topk-moe-fusion` for Qwen-style
+     `softmax -> argsort_top_k -> get_rows -> norm -> scale` routing.
+
+   The strided top-k callback read fix is a default-path fix, independent of
+   diagnostic top-k fusion. It explains the large prefill speedup observed in
+   the Phase H artifacts: Phase G was reading non-contiguous top-k views as if
+   they were compact, inflating apparent expert demand during prefill. In the
+   8000 MiB EAMC run, the average observed experts per prefill callback fell
+   from 64.0 in Phase G to about 20.7 in Phase H baseline, prefill misses fell
+   from 44581 to 11610, prefill SSD read time fell from 16799 ms to 4199 ms,
+   and prefill callback wall time fell from 23467 ms to 6498 ms. This happened
+   with top-k fusion disabled.
+
+   Root cause of the Phase G golden-logit failure was the callback/fusion
+   boundary, not a bad fused top-k ordering result: the streaming eval callback
+   stopped graph execution at `ffn_moe_topk`, but the fused CUDA router needs
+   the graph segment through final routing weights to execute as one unit.
+   Registering final weights as an alternate callback point lets fused routing
+   produce both IDs and weights before the slot loader remaps IDs and stages
+   expert weights.
+
+   Correctness is fixed for the diagnostic decode path:
+
+   - `test-topk-moe-fusion`: passed for single-token decode and multi-token
+     fallback.
+   - Golden logits with top-k fusion alone: passed, `max|d| = 0`.
+   - Golden logits with top-k + GLU fusion: passed, `max|d| = 0`.
+   - Golden logits with top-k + GLU fusion + guarded graphs: passed,
+     `max|d| = 0`.
+   - `llama-cli` chat smoke: passed.
+
+   Same-build 8000 MiB EAMC performance showed the default-path prefill gain,
+   but diagnostic top-k fusion itself did not show a material decode gain:
+
+| Metric | Phase G GLU | Phase H baseline | Phase H top-k diag |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 14021.9 ms | 5070.4 ms | 5199.6 ms |
+| Prefill hit rate | 81.9% | 85.4% | 86.0% |
+| Prefill misses | 44581 | 11610 | 11125 |
+| Prefill callback wall | 23467 ms | 6498 ms | 6610 ms |
+| TPOT / decode | 30.67 ms/token | 31.91 ms/token | 31.88 ms/token |
+| Decode hit rate | 89.2% | 88.2% | 88.3% |
+| Decode SSD read | 11.03 ms/token | 11.98 ms/token | 12.44 ms/token |
+| Decode H2D | 9.34 ms/token | 10.29 ms/token | 10.12 ms/token |
+| Decode compute | 10.37 ms/token | 10.48 ms/token | 10.11 ms/token |
+| Decode stall | 0.14 ms/token | 0.15 ms/token | 0.15 ms/token |
+| Decode predictor | 1.31 ms/token | 1.07 ms/token | 1.02 ms/token |
+| Decode callback wall | 17.06 ms/token | 18.07 ms/token | 18.37 ms/token |
+| Decode top-k D2H | 1.57 ms/token | 1.58 ms/token | 1.58 ms/token |
+
+   Conclusion: Phase H accepts the correctness fix and diagnostic harness, but
+   does not promote top-k fusion as a normal performance guard. Keep the
+   strided top-k read fix on by default. Keep top-k fusion decode-only and
+   default-off until a broader run shows consistent TPOT or callback/top-k-D2H
+   improvement.
+
+### Acceptance
+
+- Root cause of the Phase G top-k golden-logit failure is documented.
+- Synthetic top-k ids/weights match the unfused reference for supported decode
+  shapes.
+- Golden logits pass with top-k fusion alone: `max|d| <= 1e-3`.
+- Golden logits pass with top-k fusion plus accepted GLU fusion.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase G or the measured reduction is clearly
+  visible in `topk_d2h_us`/callback wall time without hurting end-to-end TPOT.
+- Secondary metrics stay within noise or improve: `h2d_us`, `stall_us`,
+  predictor time, SSD read time, hit rate, and misses/token.
+- Top-k fusion remains independently disableable and default-off until the full
+  validation matrix passes.
+
+Current status: correctness acceptance passed under `LLAMA_MOE_TOPK_FUSION_DIAG=1`;
+performance/default acceptance did not pass because TPOT and `topk_d2h_us` were
+flat and callback wall time did not improve.
+
+## Phase I - Prefill-Specific Improvements
 
 At 8000 MiB the current slot budget forces effective ubatch 8. Prefill gains
 need either more slots or a different prefill strategy.
@@ -756,7 +893,7 @@ need either more slots or a different prefill strategy.
 - Batched prefill changes pass golden logits and chat smoke before becoming
   defaults.
 
-## Phase I - Validation Matrix
+## Phase J - Validation Matrix
 
 Run after each performance phase, not only at the end.
 
@@ -847,8 +984,10 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
 5. Phase D: fix H2D buffer lifetime to recover overlap.
 6. Phase E: re-enable CUDA `.slot` fast paths one at a time.
 7. Phase F: re-enable CUDA graph capture for guarded `.slot` MMVQ decode only.
-8. Phase G: revalidate decode top-k/MoE fusion one guard at a time.
-9. Phase H: tune prefill using cache budget, cold/warm reporting, and optional
+8. Phase G: revalidate decode GLU fusion.
+9. Phase H: treat top-k MoE fusion as a dedicated correctness and decode
+   performance issue.
+10. Phase I: tune prefill using cache budget, cold/warm reporting, and optional
    hot-start.
 
 The expected biggest immediate win is Phase B. Until the EAMC lifecycle is
