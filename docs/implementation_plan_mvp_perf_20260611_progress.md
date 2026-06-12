@@ -2,7 +2,7 @@
 
 Repository under work: `C:\code\llama.cpp.offload`.
 
-This records the Phase A and Phase B implementation from
+This records the Phase A, Phase B, and Phase C implementation from
 `implementation_plan_mvp_perf_20260611.md`.
 
 Phase B keeps EAMC online during normal inference, with updates kept in DRAM.
@@ -36,6 +36,15 @@ Implemented Phase B EAMC lifecycle and persistence changes:
 - context/session teardown EAMC flush,
 - no EAMC sidecar save from per-token `slot_pool_end_request()`.
 
+Implemented Phase C EAMC scoring optimization:
+
+- sparse in-memory EAMC rows,
+- dense sidecar load/save compatibility,
+- indexed sparse cosine scoring over the uncapped corpus,
+- lazy per-callback `score_for_expert` materialization,
+- EAMC score-profile counters,
+- diagnostic-only `LLAMA_MOE_EAMC_ROWS=N` row cap.
+
 ## Code Changes
 
 ### Profiler Schema
@@ -54,6 +63,11 @@ Changed `src/moe-offload/profiler.{h,cpp}`:
   - `topk_d2h_us`
   - `slot_ids_h2d_us`
   - `slot_table_h2d_us`
+  - `eamc_rows_scored`
+  - `eamc_cosine_us`
+  - `eamc_score_materialize_us`
+  - `eamc_score_cache_hits`
+  - `eamc_score_cache_misses`
 - Added request-only fields:
   - `request_wall_us`
   - `request_end_us`
@@ -69,7 +83,7 @@ Changed `src/moe-offload/profiler.{h,cpp}`:
 The new CSV header is:
 
 ```text
-row_type,request_idx,repeat_idx,batch_idx,token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,pred_observe_us,pred_score_us,callback_wall_us,topk_d2h_us,slot_ids_h2d_us,slot_table_h2d_us,cache_resident_experts,predictor,request_wall_us,request_end_us,predictor_end_us,predictor_save_us,profile_flush_us,sidecar_write_bytes
+row_type,request_idx,repeat_idx,batch_idx,token_idx,phase,layer,k_required,k_hit,k_miss,ssd_read_us,h2d_us,compute_us,stall_us,pred_us,pred_observe_us,pred_score_us,callback_wall_us,topk_d2h_us,slot_ids_h2d_us,slot_table_h2d_us,eamc_rows_scored,eamc_cosine_us,eamc_score_materialize_us,eamc_score_cache_hits,eamc_score_cache_misses,cache_resident_experts,predictor,request_wall_us,request_end_us,predictor_end_us,predictor_save_us,profile_flush_us,sidecar_write_bytes
 ```
 
 ### Runtime Request Context
@@ -116,6 +130,15 @@ Changed `src/moe-offload/predictor.cpp`:
 - Replaced full-capacity `evict_redundant()` with FIFO/ring replacement.
 - Preserved the existing dense EAMC sidecar format.
 - Preserved online EAMC row append semantics.
+- Converted EAMC corpus rows from dense vectors to sparse per-layer
+  expert/count vectors.
+- Precomputed per-row prefix norms for dense-equivalent cosine scoring.
+- Added an inverted `(layer, expert) -> corpus row` index for uncapped sparse
+  cosine scoring.
+- Materialized one per-layer score vector on first eviction score request in a
+  callback, then served later candidate scores in O(1).
+- Kept `LLAMA_MOE_EAMC_ROWS=N` as a diagnostic-only row cap; default behavior
+  remains uncapped.
 
 ### Benchmark Calibration
 
@@ -154,6 +177,11 @@ Profiler breakdown (decode, mean per token):
   topk_d2h
   slot_ids_h2d
   slot_table_h2d
+  eamc_cosine
+  eamc_materialize
+  eamc_rows_scored
+  eamc_cache_hits
+  eamc_cache_misses
   request_end
   predictor_end
   predictor_save
@@ -200,7 +228,7 @@ Passing tests:
 
 The following Phase C+ items were intentionally not implemented:
 
-- EAMC scoring optimization.
+- Default corpus row caps or approximate EAMC scoring.
 - H2D buffer lifetime changes.
 - CUDA `.slot` `MUL_MAT_ID` fast-path restoration.
 - Any change to `llama-cli` default ubatch or chat correctness policy.
@@ -261,3 +289,75 @@ Remaining bottleneck after Phase B:
 - EAMC scoring still costs about 90.54 ms/token in decode.
 - That makes Phase C, EAMC scoring optimization, the next highest-value
   predictor-side task.
+
+## Phase C Performance Validation
+
+New Phase C files:
+
+- `tests\moe-offload\_out\phase-c-eamc-8gb.csv`
+- `tests\moe-offload\_out\phase-c-eamc-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-c-eamc-8gb.eamc`
+
+The benchmark used a copy of the model sidecar so the run did not mutate
+`C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.eamc`.
+
+```powershell
+.\build-moe\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc `
+  --moe-eamc-path tests/moe-offload/_out/phase-c-eamc-8gb.eamc `
+  --moe-profile-csv tests\moe-offload\_out\phase-c-eamc-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-c-eamc-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+The benchmark wrote complete CSV/summary artifacts but returned exit code 1
+because `llama-moe-bench` logged the existing `get_logits_ith: invalid logits
+id 0` warning during repeated summary writes.
+
+Result:
+
+| Metric | Phase B | Phase C | Change |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 25825.6 ms | 21496.1 ms | 1.20x faster |
+| TPOT / decode | 162.66 ms/token | 57.78 ms/token | 2.82x faster |
+| Total | 67466.9 ms | 36287.1 ms | 1.86x faster |
+| Prefill hit rate | 81.9% | 81.9% | about flat |
+| Decode hit rate | 90.3% | 89.6% | -0.7 pp |
+| Decode SSD read | 18.07 ms/token | 10.95 ms/token | 1.65x faster |
+| Decode H2D | 9.02 ms/token | 8.99 ms/token | about flat |
+| Decode compute | 42.26 ms/token | 33.92 ms/token | 1.25x faster |
+| Decode stall | 16.91 ms/token | 16.77 ms/token | about flat |
+| Decode predictor | 90.54 ms/token | 2.52 ms/token | 35.9x faster |
+
+Phase C EAMC counters from the CSV:
+
+- decode `eamc_cosine_us`: 1757640 us total, 2.29 ms/token,
+- decode `eamc_score_materialize_us`: 12145 us total, 0.02 ms/token,
+- decode `eamc_rows_scored`: 15864832 rows total, 20657.3 rows/token,
+- decode `eamc_score_cache_hits`: 2954.50 hits/token,
+- decode `eamc_score_cache_misses`: 20.17 misses/token.
+
+Hit-rate note:
+
+- Dense-equivalence unit tests pass for partial prefixes, repeated
+  observations, prefill-like repeated layer waves, FIFO replacement, and dense
+  sidecar round-trip.
+- The recorded Phase B and Phase C benchmark sidecars did not provide a clean
+  same-start-sidecar comparison. The final saved Phase B and Phase C sidecars
+  have the same hash, but the model sidecar copied at Phase C start has a
+  different hash from the saved Phase B artifact. Treat the measured -0.7 pp
+  decode hit-rate delta as needing a clean same-start-sidecar rerun before
+  changing EAMC defaults.
+
+Phase C acceptance status:
+
+- Predictor-time target: passed. Decode predictor time is 2.52 ms/token, below
+  the 10 ms/token target.
+- Prefill hit-rate gate: passed against the recorded Phase B profile.
+- Decode hit-rate gate: inconclusive against the recorded Phase B profile
+  because the sidecar baseline was not identical; the measured delta is
+  slightly outside the 0.5 pp gate.
+- Row caps remain diagnostic-only and are not enabled by default.

@@ -362,47 +362,125 @@ bool llama_moe::flush_predictor();
 
 After Phase B, EAMC scoring still costs about 90.54 ms/token in the 8000 MiB,
 256 prompt, 256 decode benchmark. Make it cheap enough to be a real predictor
-option.
+option without reducing EAMC cache hit rate.
+
+Phase C must be semantics-preserving first. The current EAMC scoring behavior
+is slow, but it is also the reason EAMC beats the old run's hit rate. Do not
+start by shrinking or approximating the corpus. First make the same scoring
+cheaper; only then test approximate row caps as an opt-in experiment.
+
+Current measured cost:
+
+- prefill EAMC score time: about 25.9 s across the 256-token, 3-repeat run,
+- decode EAMC score time: about 69.5 s across the 256-token, 3-repeat run,
+- decode predictor cost: 90.54 ms/token,
+- `pred_observe_us` and `predictor_end_us` are already negligible.
+
+Important prefill detail: one outer prefill `llama_decode()` contains multiple
+internal MoE callback waves because effective ubatch is 8. The callback order is
+`L0..L39` for token index 0, then `L0..L39` for token index 8, and so on. Any
+incremental EAMC state must handle this non-monotonic layer order instead of
+assuming layers only advance once from 0 to the final layer.
 
 ### Changes
 
-1. Store activation rows sparsely:
+#### C1 - Sparse Representation With Dense-Equivalent Scores
+
+1. Store activation rows sparsely while preserving the existing scoring
+   semantics:
    - per layer, only activated expert ids and counts,
-   - prefix norms per corpus row,
-   - optional dense fallback only for sidecar compatibility.
+   - counts remain callback-observation counts, not per-token frequencies,
+   - loaded dense sidecar rows are converted to sparse rows once at load time,
+   - saving still writes the existing dense sidecar format for compatibility.
 
-2. Update cosine state incrementally as layers advance:
-   - maintain `dot[row]`, `current_norm`, and corpus prefix norm,
-   - when layer `L` is observed, update only the activated experts of layer
-     `L` instead of rescanning layers `0..L`.
+2. Precompute sparse row metadata:
+   - full row norm,
+   - per-layer squared norm contribution,
+   - prefix norm for `0..L` lookup,
+   - optional per-layer sorted expert/count vectors for deterministic tests.
 
-3. Compute nearest neighbors once per layer callback, then materialize a
-   per-expert eviction score vector for that layer:
+3. Keep dense-equivalent cosine behavior for the uncapped path:
+   - for a prefix ending at layer `L`, compute dot products only over current
+     sparse activations and matching corpus layer entries,
+   - use corpus prefix norms equivalent to the dense implementation's
+     `cosine_partial()`,
+   - preserve zero-weight fallback to LRU recency when EAMC weights are zero.
+
+4. Add tests comparing old dense scoring to new sparse scoring:
+   - synthetic deterministic corpora,
+   - repeated observations in the same layer,
+   - partial-prefix scoring,
+   - prefill-like non-monotonic callback order: `L0..L39`, then `L0..L39`
+     again in the same request,
+   - loaded sidecar -> sparse conversion -> save dense sidecar round trip.
+
+#### C2 - Lazy Per-Callback Score Materialization
+
+5. Do not compute EAMC scores on callbacks that do not evict. In the slot-pool
+   flow, `score()` is only needed while selecting a victim for a miss. Keep
+   that property.
+
+6. On first `score(layer, expert)` after an `observe()` for that callback,
+   lazily compute and cache:
+   - nearest-neighbor rows for the current prefix,
+   - one `score_for_expert[expert]` vector for the requested layer,
+   - metadata counters for rows scanned and materialization cost.
+
+7. Eviction scans then read `score_for_expert[exp]` in O(1):
 
 ```text
 score_for_expert[expert] = weighted average over top EAMC neighbors
 ```
 
-Eviction scans then read `score_for_expert[exp]` in O(1).
+8. Cache invalidation rules:
+   - `begin_request()` clears current sparse activations and score caches,
+   - `observe(layer, experts)` invalidates only prefix/score caches affected by
+     the new observation,
+   - `end_request()` appends the sparse row and invalidates corpus-dependent
+     caches,
+   - prefill callback waves must not reuse a score vector computed before a
+     later observation changed the request row.
 
-4. Add runtime caps:
-   - effective corpus rows, default 128 or 256 for inference,
-   - nearest-neighbor count, default 4 or 8,
-   - optional `LLAMA_MOE_EAMC_ROWS=N` diagnostic override.
+#### C3 - Optional Corpus Row Cap, Hit-Rate Gated
 
-5. Add profile counters:
+9. Add row caps only after C1/C2 pass:
+   - default uncapped behavior should continue using all loaded corpus rows,
+   - add `LLAMA_MOE_EAMC_ROWS=N` as a diagnostic override,
+   - row selection must use newest ring/FIFO rows, not arbitrary vector order,
+   - nearest-neighbor count remains the sidecar/default value unless a
+     separate diagnostic override is added.
+
+10. A row cap cannot become the default unless it does not hurt hit rate:
+    - compare uncapped EAMC, capped EAMC, and LRU on identical cache/reset
+      settings,
+    - require decode hit rate within 0.5 percentage points of uncapped EAMC,
+    - require prefill hit rate not worse than uncapped EAMC by more than 0.5
+      percentage points,
+    - if capped EAMC is faster but hit rate regresses, keep it diagnostic only.
+
+11. Add profile counters:
    - `eamc_rows_scored`
    - `eamc_cosine_us`
    - `eamc_score_materialize_us`
+   - `eamc_score_cache_hits`
+   - `eamc_score_cache_misses`
 
 ### Acceptance
 
 - EAMC online predictor row time is below 10 ms/token on the 8000 MiB,
   256 prompt, 256 decode benchmark.
-- EAMC hit rate and TPOT are compared against LRU on identical cache/reset
-  settings.
-- If EAMC does not beat LRU after optimization, make LRU the documented
-  performance default and keep EAMC as experimental.
+- Uncapped sparse/incremental EAMC hit rates match Phase B uncapped EAMC within
+  0.5 percentage points:
+  - prefill baseline: 81.9%,
+  - decode baseline: 90.3%.
+- TPOT improves materially without increasing misses/token; target decode TPOT
+  is below 100 ms/token before Phase D/E work.
+- New dense-equivalence unit tests pass before row-cap experiments are enabled.
+- Row caps remain diagnostic unless they preserve hit rate under the gates
+  above.
+- EAMC and LRU are compared on identical cache/reset settings after C1/C2. If
+  optimized uncapped EAMC still does not beat LRU on TPOT or hit rate, make LRU
+  the documented performance default and keep EAMC experimental.
 
 ## Phase D - Remove Host Synchronization From H2D Buffer Lifetime
 
