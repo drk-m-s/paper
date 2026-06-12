@@ -2,7 +2,8 @@
 
 Repository under work: `C:\code\llama.cpp.offload`.
 
-This records the Phase A, Phase B, Phase C, and Phase D implementation from
+This records the Phase A, Phase B, Phase C, Phase D, and guarded Phase E
+implementation from
 `implementation_plan_mvp_perf_20260611.md`.
 
 Phase B keeps EAMC online during normal inference, with updates kept in DRAM.
@@ -54,6 +55,16 @@ Implemented Phase D H2D buffer lifetime changes:
   events are released,
 - miss-blob submission sorted by file offset,
 - larger CUDA event-pool retention cap to avoid per-token event churn.
+
+Implemented the guarded Phase E `.slot` MMVQ decode fast path:
+
+- quantized single-token `.slot` `MUL_MAT_ID` can use CUDA MMVQ when
+  `LLAMA_MOE_SLOT_MMVQ=1`,
+- default behavior remains the generic sorted CUDA path,
+- `.slot` fusion is disabled only under the guard so the benchmark isolates
+  unfused MMVQ,
+- CUDA graph capture remains disabled for `.slot` `MUL_MAT_ID`,
+- MMQ/MMF and multi-token prefill fast paths remain separate validation steps.
 
 ## Code Changes
 
@@ -156,6 +167,27 @@ Changed `src/moe-offload/io.{h,cpp}` and
 - Added `io_event_query()` / `moe_io_cuda_event_query()`.
 - Raised the CUDA event pool retention cap from 128 to 4096 events.
 
+### Phase E Slot MMVQ
+
+Changed `ggml/src/ggml-cuda/ggml-cuda.cu`:
+
+- Added `.slot` tensor detection helper for MoE slot-backed tensors.
+- Added `LLAMA_MOE_SLOT_MMVQ` guard parsing.
+- Re-enabled only the quantized single-token `.slot` MMVQ branch for
+  `GGML_OP_MUL_MAT_ID` when `LLAMA_MOE_SLOT_MMVQ=1`.
+- Kept `.slot` MMQ/MMF, multi-token prefill, CUDA graph capture, and fusion
+  out of this step.
+- Disabled `.slot` fusion decisions only while the MMVQ guard is enabled, so
+  default behavior remains unchanged.
+
+Added `tests/moe-offload/test-slot-mmvq.cpp` and registered it with CTest when
+the CUDA backend target is available:
+
+- synthetic Q4_0 `.slot` `MUL_MAT_ID` graph,
+- decode-shaped generic sorted path check with the guard off,
+- decode-shaped guarded MMVQ check with the guard on,
+- prefill-shaped guarded fallback check.
+
 ### EAMC Predictor
 
 Changed `src/moe-offload/predictor.cpp`:
@@ -248,6 +280,18 @@ cmake --build build-moe --config Release --target llama-moe-bench llama-bench ll
 
 Result: passed.
 
+Phase E focused builds:
+
+```powershell
+cmake --build build-moe --config Release --target test-slot-mmvq -j 8
+cmake --build build-moe --config Release --target llama-moe-bench -j 8
+```
+
+Result: passed. Building `llama-completion` also passed; the local CMake
+invocation for `llama-cli` looked for a root-level `llama-cli.vcxproj`, but the
+existing `build-moe\bin\Release\llama-cli.exe` was present and used for the chat
+smoke.
+
 MoE CTest label:
 
 ```powershell
@@ -275,12 +319,40 @@ Additional Phase D environment note:
 - Reconfiguring with `-DGGML_CUDA_COMPRESSION_MODE=none` produced a loadable
   CUDA backend and allowed `llama-moe-bench` to run.
 
+Phase E focused CTest:
+
+```powershell
+.\build-moe\bin\Release\test-slot-mmvq.exe
+ctest --test-dir build-moe -C Release -R test-slot-mmvq --output-on-failure
+```
+
+Result: passed. The standalone run reported:
+
+- decode generic sorted: `max_abs=0.05145073`, `rms=0.01440378`,
+- decode guarded MMVQ: `max_abs=0.05145073`, `rms=0.01440378`,
+- prefill guard fallback: `max_abs=0.05145073`, `rms=0.01363423`.
+
+Phase E guarded correctness gates:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\moe-offload\test-golden-logits.ps1 `
+  -StreamCacheMb 8000 -NPredict 32 -UBatch 8
+
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\moe-offload\test-llama-cli-chat.ps1 `
+  -CacheMb 8000 -Predictor eamc
+```
+
+Result: both passed. Golden logits reported `max|d| = 0`.
+
 ## Not Implemented
 
 The following Phase C+ items were intentionally not implemented:
 
 - Default corpus row caps or approximate EAMC scoring.
-- CUDA `.slot` `MUL_MAT_ID` fast-path restoration.
+- CUDA `.slot` MMQ/MMF, multi-token prefill fast paths, CUDA graph capture,
+  and top-k/fusion restoration.
 - Any change to `llama-cli` default ubatch or chat correctness policy.
 
 ## Phase B Performance Validation
@@ -482,3 +554,59 @@ Phase D acceptance status:
   the profiler is now less dominated by overlapping buckets, but the next
   optimization should focus on worker read latency/queueing and callback wall
   rather than more host event-sync removal.
+
+## Phase E Performance Validation
+
+New Phase E files:
+
+- `tests\moe-offload\_out\phase-e-slot-mmvq-8gb.csv`
+- `tests\moe-offload\_out\phase-e-slot-mmvq-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-e-slot-mmvq-8gb.eamc`
+
+The benchmark used a copy of the Phase D sidecar and enabled only the guarded
+MMVQ decode path:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+.\build-moe\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc `
+  --moe-eamc-path tests/moe-offload/_out/phase-e-slot-mmvq-8gb.eamc `
+  --moe-profile-csv tests\moe-offload\_out\phase-e-slot-mmvq-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-e-slot-mmvq-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+Result versus Phase D:
+
+| Metric | Phase D | Phase E | Change |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 19704.8 ms | 18481.0 ms | 1.07x faster |
+| TPOT / decode | 62.13 ms/token | 47.20 ms/token | 1.32x faster |
+| Total | 35609.0 ms | 30564.0 ms | 1.16x faster |
+| Prefill hit rate | 81.9% | 81.9% | flat |
+| Decode hit rate | 89.2% | 89.2% | flat |
+| Decode SSD read | 15.57 ms/token | 13.08 ms/token | 1.19x faster |
+| Decode H2D | 9.42 ms/token | 9.37 ms/token | about flat |
+| Decode compute | 34.86 ms/token | 24.34 ms/token | 1.43x faster |
+| Decode stall | 0.41 ms/token | 0.12 ms/token | 3.4x lower |
+| Decode predictor | 2.10 ms/token | 1.32 ms/token | 1.59x faster |
+| Decode callback wall | 24.33 ms/token | 19.80 ms/token | 1.23x faster |
+
+Phase E acceptance status:
+
+- Golden-logit gate with `LLAMA_MOE_SLOT_MMVQ=1`: passed, `max|d| = 0`.
+- Chat smoke with `LLAMA_MOE_SLOT_MMVQ=1`: passed with default `llama-cli`
+  ubatch 1.
+- End-to-end speed: passed. TTFT improved from 19704.8 ms to 18481.0 ms and
+  TPOT improved from 62.13 ms/token to 47.20 ms/token versus Phase D.
+- Compute gate: passed. Decode `compute_us` fell from 34.86 ms/token to
+  24.34 ms/token.
+- Secondary metrics gate: passed on this run. H2D, stall, predictor time, SSD
+  read time, callback wall time, hit rate, and misses/token were flat or better,
+  so the wall-clock gain was not offset by hidden regressions.
+- Remaining Phase E work: MMQ/MMF, multi-token prefill fast paths, CUDA graph
+  capture, and fusion remain disabled for `.slot` tensors until separately
+  validated.

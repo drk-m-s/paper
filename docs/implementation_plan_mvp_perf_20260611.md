@@ -576,7 +576,14 @@ LLAMA_MOE_SLOT_MMVQ=1
 
 - Golden-logit matrix passes with `LLAMA_MOE_SLOT_MMVQ=1`.
 - Chat smoke remains clean with default `llama-cli` ubatch 1.
+- End-to-end speed is the primary gate: prefill TTFT and decode TPOT improve
+  versus the generic sorted path on the same model, sidecar, cache budget, and
+  benchmark settings.
 - Decode `compute_us` drops significantly versus the generic sorted path.
+- Secondary metrics do not regress enough to erase the wall-clock gain:
+  `h2d_us`, `stall_us`, predictor time, SSD read time, callback wall time, hit
+  rate, and misses/token should stay within normal run-to-run noise, with any
+  larger regression explicitly justified by a faster prefill/decode result.
 - The guard can be disabled quickly if a model or shape regresses.
 
 ## Phase F - Prefill-Specific Improvements
