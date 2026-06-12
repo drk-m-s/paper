@@ -1301,3 +1301,105 @@ Phase I acceptance status:
 - Secondary metrics: mixed; H2D, predictor, hit rate, and misses/token were
   acceptable, while SSD, stall, compute, callback wall, and TPOT were worse.
 - Default status: `LLAMA_MOE_PREFILL_MMVQ=1` remains experimental/default-off.
+
+## Phase J Implementation
+
+Phase J added calibration and reporting for prefill tuning instead of changing
+the runtime defaults:
+
+- `llama-moe-bench` now records cold and warm TTFT separately. A measured
+  prefill is warm only when the cache was intentionally warmed or when repeats
+  reuse the cache without `--moe-reset-cache-between-repeats`.
+- The summary now prints prefill I/O and profiler breakdowns next to decode,
+  including prefill `compute_us`, callback wall time, top-k D2H, slot-id H2D,
+  EAMC row count, and score-cache counters.
+- `--moe-hot-start` preloads ranked experts from an EAMC sidecar before the
+  measured prefill. This is benchmark-only and default-off.
+- `slot_pool_hot_start()` clears the target cache maps and fills at most the
+  configured slot budget per layer, so stale residency metadata cannot leak
+  into the measured run.
+
+The first attempt at using profile CSV data for hot-start ranking was dropped:
+the CSV contains timing and cache counters, but not the expert IDs needed to
+construct a safe preload list. The implemented path therefore uses the EAMC
+sidecar, whose dense rows have `(layer, expert)` scores.
+
+## Phase J Validation
+
+Build:
+
+```powershell
+cmake --build build-moe-static --config Release --target llama-moe-bench -j 8
+```
+
+Warm-cache smoke:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='0'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 64 --tg 16 --repeat 2 --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc --moe-warm-cache `
+  --moe-profile-csv tests\moe-offload\_out\phase-j-smoke-warm.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-j-smoke-warm.summary.txt
+```
+
+Hot-start smoke:
+
+```powershell
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 64 --tg 16 --repeat 1 --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc --moe-hot-start `
+  --moe-profile-csv tests\moe-offload\_out\phase-j-smoke-hot.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-j-smoke-hot.summary.txt
+```
+
+The hot-start smoke preloaded 3840 slots across 40 layers, proving the path is
+mechanically wired. It did not pass the performance-promotion gate: TTFT was
+1228.2 ms versus 726.7 ms in the warm-cache smoke, and TPOT was
+46.08 ms/token. Keep `--moe-hot-start` experimental/default-off.
+
+## Phase J Cache Matrix
+
+All runs used the same static build, EAMC, `--pp 256`, `--tg 64`,
+`--repeat 2`, `--moe-reset-cache-between-repeats`,
+`LLAMA_MOE_SLOT_MMVQ=1`, `LLAMA_MOE_PREFILL_MMVQ=0`,
+`LLAMA_MOE_SLOT_GRAPHS=1`, and `LLAMA_MOE_SLOT_GLU_FUSION=1`.
+
+| Cache MiB | Slots | Effective ubatch | TTFT cold | TPOT | Prefill compute | Prefill callback | Decode compute | VRAM peak |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8000 | 96 | 8 | 5802.0 ms | 30.89 ms/token | 10.83 ms/token | 11.18 ms/token | 11.09 ms/token | 10.15 / 15.92 GB |
+| 12000 | 145 | 16 | 4204.1 ms | 25.92 ms/token | 7.49 ms/token | 8.48 ms/token | 11.43 ms/token | 14.08 / 15.92 GB |
+| 14000 | 169 | 16 | 4148.9 ms | 24.73 ms/token | 7.52 ms/token | 8.24 ms/token | 11.54 ms/token | 15.72 / 15.92 GB |
+| 16000 | 193 | 16 | 5141.3 ms | 77.68 ms/token | 11.42 ms/token | 8.18 ms/token | 62.08 ms/token | 15.92 / 15.92 GB |
+
+Interpretation:
+
+- 12000 MiB is the practical 16 GiB target recommendation for effective
+  ubatch 16. It improves cold TTFT and TPOT materially versus 8000 MiB without
+  filling VRAM.
+- 14000 MiB is slightly faster, but leaves only about 0.20 GiB reported free
+  VRAM. Treat it as a local tuning point, not a portable default.
+- 16000 MiB over-pressures VRAM on this GPU. The run regressed TTFT and decode
+  TPOT badly, with decode `compute_us` rising to 62.08 ms/token.
+- Router-aware internal prefill splitting was not implemented in Phase J. The
+  cache matrix gives a lower-risk immediate path to effective ubatch 16, while
+  the broader splitting/fusion work remains a post-closeout research item.
+
+Phase J acceptance status:
+
+- Cache budget documentation: accepted. The matrix shows the budget needed for
+  effective ubatch 16 on the 16 GiB target.
+- Cold/warm reporting: accepted. The summary reports `TTFT cold` and
+  `TTFT warm` with sample counts.
+- Prefill attribution: accepted. The summary now prints prefill I/O and
+  profiler breakdowns.
+- Hot-start: implemented but not accepted as a default. It worsened the smoke
+  TTFT and remains benchmark-only/default-off.
+- Runtime defaults: unchanged. `llama-cli --moe-offload` remains
+  correctness-first at ubatch 1, and `LLAMA_MOE_PREFILL_MMVQ=1` remains
+  experimental/default-off.

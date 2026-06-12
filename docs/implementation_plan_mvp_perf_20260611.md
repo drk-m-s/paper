@@ -997,6 +997,31 @@ need either more slots or a different prefill strategy.
 - Batched prefill changes pass golden logits and chat smoke before becoming
   defaults.
 
+Status: accepted as calibration/reporting on 2026-06-12. `llama-moe-bench`
+now reports `TTFT cold` and `TTFT warm` separately, includes prefill I/O and
+profiler breakdowns, supports `--moe-reset-cache-between-repeats` and
+`--moe-warm-cache`, and adds benchmark-only `--moe-hot-start` EAMC-sidecar
+preloading.
+
+The cache matrix on the 16 GiB dev box showed:
+
+| Cache MiB | Slots | Effective ubatch | TTFT cold | TPOT | VRAM peak |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8000 | 96 | 8 | 5802.0 ms | 30.89 ms/token | 10.15 / 15.92 GB |
+| 12000 | 145 | 16 | 4204.1 ms | 25.92 ms/token | 14.08 / 15.92 GB |
+| 14000 | 169 | 16 | 4148.9 ms | 24.73 ms/token | 15.72 / 15.92 GB |
+| 16000 | 193 | 16 | 5141.3 ms | 77.68 ms/token | 15.92 / 15.92 GB |
+
+Recommendation: use 12000 MiB as the practical 16 GiB target for effective
+ubatch 16. Treat 14000 MiB as local tuning only, and avoid 16000 MiB on this
+GPU because it over-pressures VRAM and regresses decode `compute_us`.
+
+`--moe-hot-start` is implemented but not accepted as a default. The smoke run
+preloaded 3840 slots across 40 layers, but TTFT worsened versus the warm-cache
+smoke. Router-aware internal prefill splitting remains deferred: it is a
+larger graph/runtime change, while the Phase J matrix identifies a lower-risk
+cache-budget route to prefill improvement.
+
 ## Phase K - Validation Matrix
 
 Run after each performance phase, not only at the end.
