@@ -1292,8 +1292,9 @@ Interpretation:
 Phase I acceptance status:
 
 - Batched chat safety: narrowed. The Phase I forced-ubatch chat smoke passed at
-  ubatch 8, but the historical issue stays guarded by the ubatch-1 default
-  until the broader Phase K matrix is rerun.
+  ubatch 8. Phase K later passed the broader golden-logit matrix and chat
+  smoke, while the interactive default stayed conservative because the Phase I
+  prefill MMVQ guard regressed decode TPOT.
 - Raw golden logits: passed, `max|d| = 0`.
 - Synthetic changing slot IDs/contents: passed.
 - Prefill TTFT: improved in the same-build Phase I benchmark.
@@ -1403,3 +1404,132 @@ Phase J acceptance status:
 - Runtime defaults: unchanged. `llama-cli --moe-offload` remains
   correctness-first at ubatch 1, and `LLAMA_MOE_PREFILL_MMVQ=1` remains
   experimental/default-off.
+
+## Phase K Implementation And Closeout
+
+Phase K did not add runtime fast paths. It closed the validation matrix and
+fixed two validation-harness issues found during closeout:
+
+- `test-cuda-stream` failed to link in the static Windows CUDA build because it
+  added dynamic `CUDA::cudart` while `ggml-cuda` already linked
+  `cudart_static`. The CMake rule now adds CUDA include directories directly
+  and does not add dynamic `CUDA::cudart` when `WIN32` and `GGML_STATIC` are
+  true.
+- The local ignored matrix harness recorded PASS/FAIL correctly but missed
+  numeric `max_d` and `mean_d` values because the comparator prints spaces
+  around `=`. The Phase K artifact was regenerated from the per-case logs with
+  the numeric values populated.
+
+Accepted guard stack for Phase K:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='0'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='0'
+```
+
+## Phase K Validation
+
+Build:
+
+```powershell
+cmake --build build-moe-static --config Release --target `
+  test-slot-mmvq test-topk-moe-fusion llama-completion llama-cli llama-moe-bench -j 8
+cmake --build build-moe-static --config Release --target `
+  test-cuda-stream test-eamc-cosine test-lru-eviction `
+  test-manifest-roundtrip test-repack-slices -j 8
+```
+
+CTest:
+
+```powershell
+ctest --test-dir build-moe-static -C Release -L moe-offload --output-on-failure
+```
+
+Result: passed, 8/8 tests.
+
+Golden logits:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-completion.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
+```
+
+Result: passed, `n_steps=8`, `n_vocab=248320`, `max|d|=0`,
+`mean|d|=0`.
+
+Ubatch matrix:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command `
+  "& 'tests\moe-offload\test-streaming-ubatch-matrix.ps1' `
+  -Bin '$PWD\build-moe-static\bin\Release\llama-completion.exe' `
+  -Model 'C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf' `
+  -Tol 1e-3 -NPredict 8 -Context 4096 -Prompt 'Hello' -Seed 42 `
+  -StreamCacheMb @(4000,8000,12000) -UBatch @(8,16,32,64) `
+  -OutDir 'tests\moe-offload\_out\phase-k-ubatch-matrix'"
+```
+
+Result: passed, 12/12 cases with `max|d|=0`. Artifact:
+`tests/moe-offload/_out/phase-k-ubatch-matrix/summary.csv`.
+
+Chat smoke:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-cli.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -CacheMb 8000 -Predictor lru -NPredict 64
+```
+
+Result: passed. The same smoke also passed with
+`-StreamingUBatch 8`.
+
+## Phase K Performance Closeout
+
+Final benchmark command:
+
+```powershell
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 128 --repeat 3 `
+  --moe-cache-vram-mb 12000 --moe-predictor eamc `
+  --moe-reset-cache-between-repeats `
+  --moe-profile-csv tests\moe-offload\_out\phase-k-final-12000.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase-k-final-12000.summary.txt
+```
+
+| Metric | Value |
+| --- | ---: |
+| Effective ubatch | 16 |
+| Slots | 145 / 256 |
+| TTFT cold | 4398.2 ms |
+| TPOT | 26.78 ms/token |
+| Prefill hit rate | 75.6% |
+| Decode hit rate | 92.4% |
+| Prefill `gpu_compute` | 7.49 ms/token |
+| Decode `gpu_compute` | 11.16 ms/token |
+| Prefill H2D | 4.91 ms/token |
+| Decode H2D | 6.64 ms/token |
+| Prefill stall | 0.10 ms/token |
+| Decode stall | 0.11 ms/token |
+| Prefill predictor | 0.35 ms/token |
+| Decode predictor | 0.62 ms/token |
+| Peak VRAM | 14.08 / 15.92 GB |
+
+Phase K acceptance status:
+
+- CTest matrix: accepted.
+- Golden logits: accepted.
+- Ubatch matrix: accepted.
+- Chat smoke: accepted for default ubatch and forced ubatch 8.
+- Performance closeout: accepted at the Phase J recommended 12000 MiB cache.
+- Plan status: closed. Remaining work is post-closeout: router-aware internal
+  prefill splitting, default promotion of guarded fast paths, normal top-k
+  fusion promotion, prefill graph/fusion work, and broader interactive-chat
+  prompt coverage.

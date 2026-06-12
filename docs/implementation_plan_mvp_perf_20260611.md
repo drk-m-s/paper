@@ -951,7 +951,10 @@ the guard improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed
 from 36.72 ms/token to 40.85 ms/token and decode callback wall time rose from
 22.40 ms/token to 26.00 ms/token. Keep `LLAMA_MOE_PREFILL_MMVQ=1`
 experimental/default-off; leave `llama-cli --moe-offload` at ubatch 1 until
-the broader Phase K matrix closes the historical chat-prefill issue.
+the broader Phase K matrix closes the historical chat-prefill issue. Phase K
+later passed that matrix and chat smoke, but the interactive default remains
+conservative because the Phase I prefill MMVQ guard still regressed decode
+TPOT.
 
 ## Phase J - Prefill-Specific Improvements
 
@@ -1104,6 +1107,52 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
 - unattributed wall time
 - peak VRAM
 
+Status: closed on 2026-06-12 using the static CUDA validation build.
+
+Validation evidence:
+
+- Build: `cmake --build build-moe-static --config Release --target
+  test-slot-mmvq test-topk-moe-fusion llama-completion llama-cli
+  llama-moe-bench -j 8` passed, followed by the missing registered test
+  targets.
+- CTest: `ctest --test-dir build-moe-static -C Release -L moe-offload
+  --output-on-failure` passed 8/8 tests.
+- Golden logits: accepted guard stack passed cache 4000 MiB, `-ub 8`,
+  `-n 8`, `max|d|=0`.
+- Ubatch matrix: cache 4000, 8000, and 12000 MiB crossed with ubatch 8, 16,
+  32, and 64 all passed with `max|d|=0`. Artifact:
+  `tests/moe-offload/_out/phase-k-ubatch-matrix/summary.csv`.
+- Chat smoke: `llama-cli --jinja --reasoning off` passed at the default ubatch
+  and forced `LLAMA_MOE_STREAMING_UBATCH=8`.
+- Final benchmark: 12000 MiB EAMC, `--pp 256`, `--tg 128`, `--repeat 3`,
+  `--moe-reset-cache-between-repeats`, accepted guard stack. Artifact:
+  `tests/moe-offload/_out/phase-k-final-12000.summary.txt`.
+
+Final benchmark summary:
+
+| Metric | Value |
+| --- | ---: |
+| Effective ubatch | 16 |
+| Slots | 145 / 256 |
+| TTFT cold | 4398.2 ms |
+| TPOT | 26.78 ms/token |
+| Prefill hit rate | 75.6% |
+| Decode hit rate | 92.4% |
+| Prefill `gpu_compute` | 7.49 ms/token |
+| Decode `gpu_compute` | 11.16 ms/token |
+| Prefill H2D | 4.91 ms/token |
+| Decode H2D | 6.64 ms/token |
+| Prefill stall | 0.10 ms/token |
+| Decode stall | 0.11 ms/token |
+| Prefill predictor | 0.35 ms/token |
+| Decode predictor | 0.62 ms/token |
+| Peak VRAM | 14.08 / 15.92 GB |
+
+The entire MVP perf plan is closed. Remaining work is post-closeout:
+router-aware internal prefill splitting, default promotion of guarded fast paths,
+normal top-k fusion promotion, prefill graph/fusion work, and broader
+interactive-chat prompt coverage.
+
 ## Recommended Order
 
 1. Phase A: add missing profiler buckets.
@@ -1120,7 +1169,8 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
     blockers.
 11. Phase J: tune prefill using cache budget, cold/warm reporting, and optional
     hot-start.
+12. Phase K: closeout validation matrix.
 
-The expected biggest immediate win is Phase B. Until the EAMC lifecycle is
-fixed, decode wall time is dominated by work that the current CSV does not
-attribute to any layer.
+The expected biggest immediate win was Phase B. The plan has now completed
+through Phase K with the final accepted defaults and remaining items documented
+as post-closeout work.
