@@ -938,6 +938,21 @@ decode and prefill.
   hit rate, misses/token, and required experts/callback.
 - All new prefill compute guards remain independently disableable.
 
+Status: partially accepted on 2026-06-12. Phase I added guarded multi-token
+`.slot` MMVQ prefill through `LLAMA_MOE_PREFILL_MMVQ=1`, requiring
+`LLAMA_MOE_SLOT_MMVQ=1` as the parent guard. Synthetic CUDA coverage passed for
+multi-token shapes with changing slot IDs and changed slot tensor contents.
+Raw-completion golden logits passed with `max|d|=0`, and formatted
+`llama-cli --jinja --reasoning off` chat smoke passed both at the
+correctness-first default and with forced `LLAMA_MOE_STREAMING_UBATCH=8`.
+
+Default promotion is not accepted. In the 8000 MiB EAMC same-build benchmark,
+the guard improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed
+from 36.72 ms/token to 40.85 ms/token and decode callback wall time rose from
+22.40 ms/token to 26.00 ms/token. Keep `LLAMA_MOE_PREFILL_MMVQ=1`
+experimental/default-off; leave `llama-cli --moe-offload` at ubatch 1 until
+the broader Phase K matrix closes the historical chat-prefill issue.
+
 ## Phase J - Prefill-Specific Improvements
 
 At 8000 MiB the current slot budget forces effective ubatch 8. Prefill gains

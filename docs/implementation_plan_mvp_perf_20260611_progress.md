@@ -1180,3 +1180,124 @@ Phase H acceptance status:
   callback wall time were slightly worse.
 - Default status: keep top-k fusion default-off and diagnostic-only through
   `LLAMA_MOE_TOPK_FUSION_DIAG=1`.
+
+## Phase I Implementation
+
+Phase I added a separate guarded multi-token `.slot` MMVQ prefill path:
+
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+  - Added `LLAMA_MOE_PREFILL_MMVQ=1`.
+  - `.slot` quantized `MUL_MAT_ID` now enters MMVQ for multi-token shapes only
+    when both `LLAMA_MOE_SLOT_MMVQ=1` and `LLAMA_MOE_PREFILL_MMVQ=1` are set.
+  - Decode behavior under `LLAMA_MOE_SLOT_MMVQ=1` is unchanged.
+  - Prefill CUDA graphs and prefill GLU fusion remain disabled.
+
+- `tests/moe-offload/test-slot-mmvq.cpp`
+  - Added guarded prefill MMVQ coverage for `n_tokens=4`.
+  - Added replay-style prefill coverage that changes slot IDs and slot tensor
+    contents across five iterations.
+  - Kept the prefill graph/fusion fallback checks.
+
+## Phase I Validation
+
+Focused build:
+
+```powershell
+cmake --build build-moe-static --config Release --target test-slot-mmvq llama-cli llama-completion llama-moe-bench -j 8
+```
+
+CTest:
+
+```powershell
+ctest --test-dir build-moe-static -C Release -R test-slot-mmvq --output-on-failure
+```
+
+Result: passed.
+
+Direct synthetic output included:
+
+```text
+[test-slot-mmvq] prefill guarded MMVQ OK max_abs=0.05145073 rms=0.01363423
+[test-slot-mmvq] prefill guarded MMVQ replay iter=4 OK max_abs=0.05194092 rms=0.01368954
+```
+
+Golden-logit gate:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests\moe-offload\test-golden-logits.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-completion.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
+```
+
+Result:
+
+```text
+n_steps  = 8
+n_vocab  = 248320
+max|d|   = 0
+mean|d|  = 0
+PASS
+```
+
+Chat smoke:
+
+- Default `llama-cli --moe-offload --jinja --reasoning off`: passed.
+- Forced `LLAMA_MOE_STREAMING_UBATCH=8`: passed.
+
+## Phase I Performance Validation
+
+Artifacts:
+
+- `tests\moe-offload\_out\phase-i-baseline-8gb.csv`
+- `tests\moe-offload\_out\phase-i-baseline-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-i-prefill-mmvq-8gb.csv`
+- `tests\moe-offload\_out\phase-i-prefill-mmvq-8gb.summary.txt`
+
+Both runs used the same static build, 8000 MiB cache, EAMC, `--pp 256`,
+`--tg 256`, and `--repeat 3`. The baseline enabled the accepted Phase F/G
+guards. The Phase I run additionally enabled `LLAMA_MOE_PREFILL_MMVQ=1`.
+
+| Metric | Phase I baseline | Phase I prefill MMVQ |
+| --- | ---: | ---: |
+| TTFT / prefill | 6505.2 ms | 6202.5 ms |
+| Prefill tok/s | 39 | 41 |
+| Prefill hit rate | 85.3% | 84.2% |
+| TPOT / decode | 36.72 ms/token | 40.85 ms/token |
+| Decode hit rate | 88.3% | 88.5% |
+| Decode SSD read | 14.80 ms/token | 18.56 ms/token |
+| Decode H2D | 10.23 ms/token | 10.01 ms/token |
+| Decode compute | 10.81 ms/token | 11.31 ms/token |
+| Decode stall | 0.53 ms/token | 0.60 ms/token |
+| Decode predictor | 1.89 ms/token | 1.67 ms/token |
+| Decode callback wall | 22.40 ms/token | 26.00 ms/token |
+| Decode top-k D2H | 1.62 ms/token | 1.63 ms/token |
+| Decode misses/token | 20.55 | 18.73 |
+
+Interpretation:
+
+- The guarded multi-token `.slot` MMVQ prefill path is correctness-clean in
+  synthetic, raw-logit, and formatted-chat smoke coverage.
+- It did not pass the default-promotion performance gate in the 8000 MiB EAMC
+  benchmark because decode TPOT regressed despite a modest TTFT improvement.
+- Keep `LLAMA_MOE_PREFILL_MMVQ=1` independently disableable and default-off.
+
+Phase I acceptance status:
+
+- Batched chat safety: narrowed. The Phase I forced-ubatch chat smoke passed at
+  ubatch 8, but the historical issue stays guarded by the ubatch-1 default
+  until the broader Phase K matrix is rerun.
+- Raw golden logits: passed, `max|d| = 0`.
+- Synthetic changing slot IDs/contents: passed.
+- Prefill TTFT: improved in the same-build Phase I benchmark.
+- Decode TPOT: regressed in the same-build Phase I benchmark.
+- Secondary metrics: mixed; H2D, predictor, hit rate, and misses/token were
+  acceptable, while SSD, stall, compute, callback wall, and TPOT were worse.
+- Default status: `LLAMA_MOE_PREFILL_MMVQ=1` remains experimental/default-off.
