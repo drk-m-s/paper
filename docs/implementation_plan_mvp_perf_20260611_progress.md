@@ -2,8 +2,8 @@
 
 Repository under work: `C:\code\llama.cpp.offload`.
 
-This records the Phase A, Phase B, Phase C, Phase D, and guarded Phase E
-implementation from
+This records the Phase A, Phase B, Phase C, Phase D, guarded Phase E, guarded
+Phase F, and guarded Phase G implementation from
 `implementation_plan_mvp_perf_20260611.md`.
 
 Phase B keeps EAMC online during normal inference, with updates kept in DRAM.
@@ -828,3 +828,153 @@ Post-repair smoke results:
   exited 0 and wrote nonempty profile/summary artifacts.
 - `build-moe\bin\Release\llama-cli.exe` answered `what is 1 + 1?` with `2`
   and exited 0.
+
+## Phase G Implementation
+
+Phase G was implemented as a split result:
+
+- accepted guarded decode-only `.slot` quantized `MUL_MAT_ID + GLU` fusion via
+  `LLAMA_MOE_SLOT_GLU_FUSION=1`,
+- kept top-k MoE fusion disabled in `LLAMA_MOE_OFFLOAD` builds after a
+  revalidation failure,
+- kept defaults correctness-first.
+
+Code changes:
+
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+  - Added `LLAMA_MOE_SLOT_GLU_FUSION=1`.
+  - Allows `.slot` GLU fusion only when all of these are true:
+    `LLAMA_MOE_SLOT_MMVQ=1`, `LLAMA_MOE_SLOT_GLU_FUSION=1`, quantized
+    `.slot` weights, F32 activations/output, I32 ids, and single-token decode.
+  - Keeps `.slot` MMVF fusion disabled.
+  - Keeps standalone `.slot` add/bias fusion disabled; only the GLU subgraph
+    call sites pass the new allow flag.
+  - Leaves `LLAMA_MOE_TOPK_FUSION=1` ignored in `LLAMA_MOE_OFFLOAD` builds
+    after golden-logit revalidation failed.
+
+- `tests/moe-offload/test-slot-mmvq.cpp`
+  - Added a synthetic two-matrix `.slot` GLU graph:
+    `MUL_MAT_ID(gate.slot)`, `MUL_MAT_ID(up.slot)`, `SWIGLU`.
+  - Compares guarded GLU fusion output against the existing unfused CUDA
+    baseline.
+  - Replays the fused GLU graph while changing slot contents and slot ids.
+  - Confirms multi-token/prefill-shaped GLU input still falls back cleanly.
+
+## Phase G Validation
+
+Focused build and CTest:
+
+```powershell
+cmake --build build-moe-static --config Release --target test-slot-mmvq llama-completion llama-cli llama-moe-bench -j 8
+ctest --test-dir build-moe-static -C Release -R test-slot-mmvq --output-on-failure
+```
+
+Result:
+
+```text
+1/1 Test #53: test-slot-mmvq ...................   Passed
+```
+
+Golden logits and chat smoke used the static validation build because the
+shared CUDA DLL path had previously been blocked by Windows Smart App Control:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION='1' # ignored in LLAMA_MOE_OFFLOAD builds
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests\moe-offload\test-golden-logits.ps1 `
+  -Bin .\build-moe-static\bin\Release\llama-completion.exe `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin .\build-moe-static\bin\Release\llama-cli.exe `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -CacheMb 8000 -Predictor lru -NPredict 64
+```
+
+Results:
+
+- Golden logits: passed, `max|d| = 0`.
+- Chat smoke: passed.
+
+Experimental top-k MoE fusion was also re-enabled during Phase G before being
+disabled again. With `LLAMA_MOE_TOPK_FUSION=1` actually active, the same golden
+gate failed:
+
+```text
+n_steps  = 8
+n_vocab  = 248320
+max|d|   = 4.639292e-01
+mean|d|  = 3.669774e-02
+tol      = 1.000000e-03
+FAIL: max|d| at step 3
+```
+
+That result keeps top-k MoE fusion open as a correctness issue rather than an
+accepted Phase G optimization.
+
+## Phase G Performance Validation
+
+Benchmark artifacts:
+
+- `tests\moe-offload\_out\phase-g-baseline-8gb.csv`
+- `tests\moe-offload\_out\phase-g-baseline-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-g-baseline-8gb.eamc`
+- `tests\moe-offload\_out\phase-g-baseline-8gb.stdout.txt`
+- `tests\moe-offload\_out\phase-g-slot-glu-8gb.csv`
+- `tests\moe-offload\_out\phase-g-slot-glu-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-g-slot-glu-8gb.eamc`
+- `tests\moe-offload\_out\phase-g-slot-glu-8gb.stdout.txt`
+
+Both runs used copies of the Phase F sidecar. Baseline enabled Phase F guards;
+the Phase G run additionally enabled `LLAMA_MOE_SLOT_GLU_FUSION=1`.
+
+```powershell
+Copy-Item -Force `
+  tests\moe-offload\_out\phase-f-slot-graphs-8gb.eamc `
+  tests\moe-offload\_out\phase-g-baseline-8gb.eamc
+Copy-Item -Force `
+  tests\moe-offload\_out\phase-f-slot-graphs-8gb.eamc `
+  tests\moe-offload\_out\phase-g-slot-glu-8gb.eamc
+```
+
+Result versus same-build Phase F guard baseline:
+
+| Metric | Phase F guards | Phase G GLU | Change |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 14719.8 ms | 14021.9 ms | 1.05x faster |
+| TPOT / decode | 31.56 ms/token | 30.67 ms/token | 1.03x faster |
+| Total | 22798.5 ms | 21873.7 ms | 1.04x faster |
+| Prefill hit rate | 81.9% | 81.9% | flat |
+| Decode hit rate | 89.2% | 89.2% | flat |
+| Decode SSD read | 11.82 ms/token | 11.03 ms/token | 1.07x faster |
+| Decode H2D | 9.35 ms/token | 9.34 ms/token | flat |
+| Decode compute | 10.44 ms/token | 10.37 ms/token | flat |
+| Decode stall | 0.12 ms/token | 0.14 ms/token | about flat |
+| Decode predictor | 1.27 ms/token | 1.31 ms/token | about flat |
+| Decode callback wall | 17.78 ms/token | 17.06 ms/token | 1.04x faster |
+| Decode top-k D2H | 1.57 ms/token | 1.57 ms/token | flat |
+| Decode misses/token | 20.78 | 20.78 | flat |
+
+Phase G acceptance status:
+
+- GLU golden-logit gate: passed, `max|d| = 0`.
+- GLU chat smoke: passed with default `llama-cli` ubatch 1.
+- GLU synthetic CUDA replay: passed with changing slot ids and contents.
+- End-to-end speed: passed modestly. TPOT improved from 31.56 ms/token to
+  30.67 ms/token in the same static build.
+- Compute/callback gate: callback wall improved from 17.78 ms/token to
+  17.06 ms/token; `gpu_compute` stayed effectively flat.
+- Secondary metrics gate: passed. H2D, top-k D2H, hit rate, misses/token, and
+  predictor time stayed within noise.
+- Top-k fusion: failed golden logits and remains disabled/open.
+- Caveat: both `llama-moe-bench` runs wrote complete summaries but returned a
+  nonzero process code after repeated `get_logits_ith: invalid logits id 0`
+  warnings. The summaries were still emitted successfully and are usable for
+  timing comparison, but this bench exit-code issue remains separate cleanup.

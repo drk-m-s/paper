@@ -690,13 +690,24 @@ LLAMA_MOE_TOPK_FUSION=1
 5. If a fusion affects prefill or multi-token shapes, leave that part disabled
    and move it to the prefill phase.
 
+6. Phase G implementation result:
+   - accepted `LLAMA_MOE_SLOT_GLU_FUSION=1` for quantized `.slot`
+     single-token `MUL_MAT_ID + GLU` decode only,
+   - kept top-k MoE fusion disabled in `LLAMA_MOE_OFFLOAD` builds because
+     the guarded single-row decode revalidation still failed golden logits,
+   - left multi-token/prefill fusion work for Phase H or later.
+
 ### Acceptance
 
-- Golden-logit matrix passes for each enabled fusion and for the combined
-  decode-fusion configuration.
+- Golden-logit matrix passes for each accepted enabled fusion and for the
+  accepted combined decode-fusion configuration.
+- Any fusion that fails golden logits remains disabled by default and is
+  documented as still open.
 - Chat smoke remains clean with default `llama-cli` ubatch 1.
 - Decode TPOT improves versus Phase E/F on the same benchmark settings.
-- Decode `compute_us` and/or callback wall time drops materially.
+- Decode `compute_us` and/or callback wall time drops materially; if
+  `compute_us` is flat, the plan must explicitly record where the wall-clock
+  benefit appears.
 - Secondary metrics stay within noise or improve: `h2d_us`, `stall_us`,
   predictor time, SSD read time, hit rate, and misses/token.
 - Any fusion guard can be disabled independently if a model or shape regresses.
