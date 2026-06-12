@@ -2,7 +2,7 @@
 
 Repository under work: `C:\code\llama.cpp.offload`.
 
-This records the Phase A, Phase B, and Phase C implementation from
+This records the Phase A, Phase B, Phase C, and Phase D implementation from
 `implementation_plan_mvp_perf_20260611.md`.
 
 Phase B keeps EAMC online during normal inference, with updates kept in DRAM.
@@ -44,6 +44,16 @@ Implemented Phase C EAMC scoring optimization:
 - lazy per-callback `score_for_expert` materialization,
 - EAMC score-profile counters,
 - diagnostic-only `LLAMA_MOE_EAMC_ROWS=N` row cap.
+
+Implemented Phase D H2D buffer lifetime changes:
+
+- nonblocking CUDA event query API,
+- async pinned-buffer lifetime tracking for H2D staging buffers,
+- preserved `cudaStreamWaitEvent()` compute-stream ordering,
+- request-end/reset/shutdown drains for outstanding H2D buffers before profile
+  events are released,
+- miss-blob submission sorted by file offset,
+- larger CUDA event-pool retention cap to avoid per-token event churn.
 
 ## Code Changes
 
@@ -122,6 +132,29 @@ Changed `src/moe-offload/slot_pool.{h,cpp}`:
   each internal decode batch.
 - Added `slot_pool_flush_predictor()` to save dirty EAMC state only at
   explicit flush/session end.
+
+### Phase D H2D Lifetime
+
+Changed `src/moe-offload/slot_pool.cpp`:
+
+- Added `inflight_h2d` records for pinned staging buffers whose async H2D copy
+  has been submitted but whose end event has not completed.
+- Kept `io_compute_wait(s.compute_backend, h2d_event)` on every async H2D
+  completion so the CUDA compute stream still waits before consuming the slot.
+- Removed the normal per-completion `io_event_sync(h2d_event)` host block.
+- Recycled pinned buffers through `io_event_query(h2d_event)` polling at
+  callback start, after draining worker completions, and while waiting for free
+  pinned buffers.
+- Added request-end, reset, reconfigure, cache-reset, and shutdown drains so
+  no profile row releases a borrowed H2D event before its pinned buffer is safe.
+- Kept a blocking fallback if compute-stream wait insertion fails.
+- Sorted miss blobs by file offset before worker submission.
+
+Changed `src/moe-offload/io.{h,cpp}` and
+`ggml/src/ggml-cuda/moe_offload_io.cu`:
+
+- Added `io_event_query()` / `moe_io_cuda_event_query()`.
+- Raised the CUDA event pool retention cap from 128 to 4096 events.
 
 ### EAMC Predictor
 
@@ -207,29 +240,46 @@ cmake --build build-moe --config Release --target llama-moe-bench llama-bench te
 
 Result: passed.
 
+Phase D focused build:
+
+```powershell
+cmake --build build-moe --config Release --target llama-moe-bench llama-bench llama-completion
+```
+
+Result: passed.
+
 MoE CTest label:
 
 ```powershell
 ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure
 ```
 
-Result: 6/6 passed.
+Phase A-C result: 6/6 passed.
+
+Phase D result on 2026-06-12: 5/6 passed. `test-cuda-stream` did not start
+because Windows Application Control blocked the freshly rebuilt unsigned
+`test-cuda-stream.exe`; the other MoE tests passed:
 
 Passing tests:
 
-- `test-cuda-stream`
 - `test-eamc-cosine`
 - `test-lru-eviction`
 - `test-manifest-roundtrip`
 - `test-repack-slices`
 - `test-moe-oracle-failfast`
 
+Additional Phase D environment note:
+
+- Rebuilding `ggml-cuda.dll` with the default compressed CUDA fatbin was also
+  blocked by Windows Application Control (`0xc0e90002`) on this dev box.
+- Reconfiguring with `-DGGML_CUDA_COMPRESSION_MODE=none` produced a loadable
+  CUDA backend and allowed `llama-moe-bench` to run.
+
 ## Not Implemented
 
 The following Phase C+ items were intentionally not implemented:
 
 - Default corpus row caps or approximate EAMC scoring.
-- H2D buffer lifetime changes.
 - CUDA `.slot` `MUL_MAT_ID` fast-path restoration.
 - Any change to `llama-cli` default ubatch or chat correctness policy.
 
@@ -361,3 +411,74 @@ Phase C acceptance status:
   because the sidecar baseline was not identical; the measured delta is
   slightly outside the 0.5 pp gate.
 - Row caps remain diagnostic-only and are not enabled by default.
+
+## Phase D Performance Validation
+
+New Phase D files:
+
+- `tests\moe-offload\_out\phase-d-eamc-8gb.csv`
+- `tests\moe-offload\_out\phase-d-eamc-8gb.summary.txt`
+- `tests\moe-offload\_out\phase-d-eamc-8gb.eamc`
+
+The benchmark used a copy of the model sidecar so the run did not mutate
+`C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.eamc`.
+
+The command was run from `build-moe\bin\Release` after configuring
+`build-moe` with `-DGGML_CUDA_COMPRESSION_MODE=none`:
+
+```powershell
+.\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc `
+  --moe-eamc-path C:/code/llama.cpp.offload/tests/moe-offload/_out/phase-d-eamc-8gb.eamc `
+  --moe-profile-csv C:/code/llama.cpp.offload/tests/moe-offload/_out/phase-d-eamc-8gb.csv `
+  --moe-profile-summary C:/code/llama.cpp.offload/tests/moe-offload/_out/phase-d-eamc-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+Result versus the most recent pre-Phase-D `moe-summary.txt`:
+
+| Metric | Pre-Phase-D latest | Phase D | Change |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 16741.3 ms | 19704.8 ms | 0.85x as fast |
+| TPOT / decode | 57.92 ms/token | 62.13 ms/token | 0.93x as fast |
+| Total | 31568.9 ms | 35609.0 ms | 0.89x as fast |
+| Prefill hit rate | 80.6% | 81.9% | +1.3 pp |
+| Decode hit rate | 89.4% | 89.2% | -0.2 pp |
+| Decode SSD read | 13.51 ms/token | 15.57 ms/token | 15.2% slower |
+| Decode H2D | 9.20 ms/token | 9.42 ms/token | 2.4% slower |
+| Decode compute | 35.17 ms/token | 34.86 ms/token | about flat |
+| Decode stall | 16.84 ms/token | 0.41 ms/token | 41.1x lower |
+| Decode predictor | 0.87 ms/token | 2.10 ms/token | 2.4x slower |
+| Decode callback wall | 22.42 ms/token | 24.33 ms/token | 8.5% slower |
+
+Result versus the recorded Phase C artifact:
+
+| Metric | Phase C | Phase D | Change |
+| --- | ---: | ---: | ---: |
+| TPOT / decode | 57.78 ms/token | 62.13 ms/token | 0.93x as fast |
+| Prefill hit rate | 81.9% | 81.9% | flat |
+| Decode hit rate | 89.6% | 89.2% | -0.4 pp |
+| Decode stall | 16.77 ms/token | 0.41 ms/token | 40.9x lower |
+| Decode SSD read | 10.95 ms/token | 15.57 ms/token | 42.2% slower |
+| Decode callback wall | 21.28 ms/token | 24.33 ms/token | 14.3% slower |
+
+Phase D acceptance status:
+
+- `stall_us` reduction: passed. The per-completion host event sync was removed
+  from the normal path, and decode stall fell from about 16.8 ms/token to
+  0.41 ms/token.
+- Hit-rate preservation: passed against the latest root summary and within the
+  Phase C 0.5 pp gate for decode.
+- End-to-end speed: not passed on this run. TPOT regressed from 57.92 to
+  62.13 ms/token versus the latest root summary, and from 57.78 to
+  62.13 ms/token versus Phase C.
+- New bottleneck: the removed stall did not translate into wall-clock speedup
+  because worker `ssd_read_us`, callback wall, and EAMC predictor time were
+  higher in the Phase D run. The wall/profile reconciliation improved sharply
+  (`unattributed_decode_us` moved from about -13.9 s to -0.6 s), which confirms
+  the profiler is now less dominated by overlapping buckets, but the next
+  optimization should focus on worker read latency/queueing and callback wall
+  rather than more host event-sync removal.

@@ -484,6 +484,16 @@ score_for_expert[expert] = weighted average over top EAMC neighbors
 
 ## Phase D - Remove Host Synchronization From H2D Buffer Lifetime
 
+Status: implemented and benchmarked on 2026-06-12. The normal miss-completion
+path no longer synchronizes the host on each H2D event before recycling pinned
+memory; pinned buffers are released by polling the H2D end event. This reduced
+decode `stall_us` from about 16.8 ms/token to 0.41 ms/token on the 8000 MiB
+EAMC benchmark. End-to-end TPOT did not improve in that run (57.92 -> 62.13
+ms/token versus the latest root summary) because `ssd_read_us`, callback wall,
+and predictor time rose. Treat Phase D as an overlap/profiler-correctness fix,
+not yet a throughput win. See
+`implementation_plan_mvp_perf_20260611_progress.md` for artifacts and metrics.
+
 Current async H2D is ordered correctly but the host waits for every event
 before recycling pinned memory. Replace this with asynchronous lifetime
 tracking.
