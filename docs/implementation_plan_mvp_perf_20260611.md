@@ -546,6 +546,12 @@ bool io_event_query(void * ev);
 
 ## Phase E - Restore Safe CUDA Slot Fast Paths
 
+Status: partially implemented and validated on 2026-06-12. Guarded quantized
+single-token `.slot` MMVQ decode is available with `LLAMA_MOE_SLOT_MMVQ=1` and
+improved TPOT from 62.13 ms/token to 47.20 ms/token on the 8000 MiB EAMC
+benchmark. This did not fully close the decode `compute_us` opportunity because
+CUDA graph capture and top-k/MoE fusion remain disabled for `.slot`.
+
 Once host-side overhead is controlled, attack `compute_us`.
 
 ### Changes
@@ -586,7 +592,107 @@ LLAMA_MOE_SLOT_MMVQ=1
   larger regression explicitly justified by a faster prefill/decode result.
 - The guard can be disabled quickly if a model or shape regresses.
 
-## Phase F - Prefill-Specific Improvements
+## Phase F - Decode CUDA Graphs For Guarded Slot MMVQ
+
+Known issue link: `docs/moe-offload/known-issues.md`, "Specialized `.slot`
+`MUL_MAT_ID` Paths Are Mostly Bypassed".
+
+Decode is still paying correctness-first launch/order overhead after Phase E.
+The guarded MMVQ path removes part of `compute_us`, but CUDA graph capture is
+still disabled for every `.slot` `MUL_MAT_ID`. Re-enable it only for the
+already-validated decode shape, not for prefill.
+
+### Changes
+
+1. Add a graph-capture compatibility predicate for `.slot` `MUL_MAT_ID`:
+   - require `LLAMA_MOE_SLOT_MMVQ=1`,
+   - require quantized `src0`,
+   - require single-token decode shape,
+   - require MMVQ-supported batch/slot dimensions,
+   - keep generic sorted, MMQ/MMF, and prefill shapes graph-disabled.
+
+2. Prove callback/remap ordering before enabling the graph path:
+   - the eval callback must complete slot-id writes before graph replay,
+   - H2D expert copies must still insert compute-stream waits before use,
+   - graph replay must not capture stale slot-id contents or stale H2D events.
+
+3. Add a focused CUDA test:
+   - build the same synthetic `.slot` MMVQ decode graph used by
+     `test-slot-mmvq`,
+   - run repeated decode replays with changing slot ids and changing slot
+     contents,
+   - compare against CPU/reference output on every replay.
+
+4. Add a guard separate from Phase E if useful:
+
+```text
+LLAMA_MOE_SLOT_GRAPHS=1
+```
+
+5. Keep `llama-cli` default prefill and all multi-token prefill shapes
+   unchanged.
+
+### Acceptance
+
+- Golden-logit matrix passes with `LLAMA_MOE_SLOT_MMVQ=1` and graph guard on.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase E on the same model, sidecar, cache budget,
+  and benchmark settings.
+- Decode `compute_us` drops versus Phase E; if the improvement appears mostly
+  in unattributed wall time instead, document why the profiler bucket does not
+  capture the graph benefit.
+- `h2d_us`, `stall_us`, predictor time, SSD read time, callback wall time, hit
+  rate, and misses/token do not regress enough to erase the decode wall-clock
+  gain.
+- Any graph guard can be disabled independently from `LLAMA_MOE_SLOT_MMVQ`.
+
+## Phase G - Decode Top-k And MoE Fusion Revalidation
+
+Known issue link: `docs/moe-offload/known-issues.md`, "CUDA Top-k MoE Fusion Is
+Disabled".
+
+CUDA top-k MoE fusion was disabled because it was sufficient to reproduce the
+historical streaming logit drift. After the unfused guarded MMVQ decode path is
+correct, revalidate fusion as a decode-only optimization. Do not use this phase
+to fix batched prefill.
+
+### Changes
+
+1. Inventory currently disabled CUDA fusion points in `LLAMA_MOE_OFFLOAD`:
+   - top-k MoE fusion,
+   - GLU/MoE fusion around `MUL_MAT_ID`,
+   - any fused mul-mat-vector path currently excluded for `.slot`.
+
+2. Add independent fusion guards so each path can be isolated:
+
+```text
+LLAMA_MOE_SLOT_GLU_FUSION=1
+LLAMA_MOE_TOPK_FUSION=1
+```
+
+3. Validate one fusion at a time on decode shape:
+   - start from Phase E guarded MMVQ,
+   - run synthetic CUDA tests with changing slot ids and slot contents,
+   - run golden logits after each fusion is enabled,
+   - run chat smoke after each fusion is enabled.
+
+4. Keep the default off until a full decode validation matrix passes.
+
+5. If a fusion affects prefill or multi-token shapes, leave that part disabled
+   and move it to the prefill phase.
+
+### Acceptance
+
+- Golden-logit matrix passes for each enabled fusion and for the combined
+  decode-fusion configuration.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase E/F on the same benchmark settings.
+- Decode `compute_us` and/or callback wall time drops materially.
+- Secondary metrics stay within noise or improve: `h2d_us`, `stall_us`,
+  predictor time, SSD read time, hit rate, and misses/token.
+- Any fusion guard can be disabled independently if a model or shape regresses.
+
+## Phase H - Prefill-Specific Improvements
 
 At 8000 MiB the current slot budget forces effective ubatch 8. Prefill gains
 need either more slots or a different prefill strategy.
@@ -630,7 +736,7 @@ need either more slots or a different prefill strategy.
 - Batched prefill changes pass golden logits and chat smoke before becoming
   defaults.
 
-## Phase G - Validation Matrix
+## Phase I - Validation Matrix
 
 Run after each performance phase, not only at the end.
 
@@ -720,7 +826,9 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
 4. Phase C: optimize EAMC scoring only if EAMC still looks useful versus LRU.
 5. Phase D: fix H2D buffer lifetime to recover overlap.
 6. Phase E: re-enable CUDA `.slot` fast paths one at a time.
-7. Phase F: tune prefill using cache budget, cold/warm reporting, and optional
+7. Phase F: re-enable CUDA graph capture for guarded `.slot` MMVQ decode only.
+8. Phase G: revalidate decode top-k/MoE fusion one guard at a time.
+9. Phase H: tune prefill using cache budget, cold/warm reporting, and optional
    hot-start.
 
 The expected biggest immediate win is Phase B. Until the EAMC lifecycle is
