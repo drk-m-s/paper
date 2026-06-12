@@ -849,7 +849,96 @@ Current status: correctness acceptance passed under `LLAMA_MOE_TOPK_FUSION_DIAG=
 performance/default acceptance did not pass because TPOT and `topk_d2h_us` were
 flat and callback wall time did not improve.
 
-## Phase I - Prefill-Specific Improvements
+## Phase I - Prefill Correctness And Multi-Token Compute Fast Paths
+
+Known issue links:
+
+- `docs/moe-offload/known-issues.md`, "Batched Streaming Chat Prefill Is Not
+  Yet Safe".
+- `docs/moe-offload/known-issues.md`, "Specialized `.slot` `MUL_MAT_ID` Paths
+  Are Mostly Bypassed".
+
+Before tuning prefill cache policy, close or isolate the remaining prefill
+correctness and compute-path blockers. The current Phase H baseline made
+prefill much faster by fixing strided top-k callback reads, but it still uses
+mostly generic sorted `.slot` compute for multi-token prefill. The known
+batched `llama-cli` chat issue also prevents making larger prefill ubatches a
+normal interactive-chat default.
+
+This phase targets both prefill and decode `compute_us`, but its first priority
+is prefill safety. Do not enable a faster multi-token path by default until the
+formatted-chat smoke passes.
+
+### Changes
+
+1. Split the prefill problem into two independent gates:
+   - raw-completion/logit correctness at larger streaming ubatches,
+   - formatted `llama-cli --jinja --reasoning off` chat correctness at the same
+     ubatches.
+
+2. Reproduce and instrument the open batched-chat-prefill issue:
+   - run `LLAMA_MOE_STREAMING_UBATCH=1`, `4`, and `8`,
+   - capture exact prompts and transcripts for the known failures,
+   - compare chat-template prefill batches against raw completion with the same
+     token sequence where possible,
+   - keep `llama-cli` default at ubatch 1 while this gate is open.
+
+3. Audit multi-token prefill compute paths that are still bypassed:
+   - generic sorted `.slot` `MUL_MAT_ID`,
+   - guarded MMVQ/MMQ/MMF candidates for `.slot`,
+   - generic sorted CUDA graph capture,
+   - non-GLU fusion paths,
+   - any path that currently only accepts single-token decode.
+
+4. Add focused synthetic tests before turning on any multi-token path:
+   - multi-token `.slot` `MUL_MAT_ID` with changing slot IDs and slot contents,
+   - quantized MMQ/MMF prefill shapes if supported by tensor type,
+   - graph replay with changing slot IDs for multi-token shapes,
+   - fallback checks showing unsupported shapes still use the safe path.
+
+5. Validate in increasing-risk order:
+   - synthetic CUDA tests,
+   - raw-completion golden logits at `-ub 4`, `-ub 8`, and the auto effective
+     ubatch,
+   - `llama-cli` chat smoke at the same ubatches,
+   - 8000 MiB EAMC benchmark against the Phase H baseline.
+
+6. Measure both prefill and decode compute effects:
+   - prefill TTFT and per-token ms,
+   - prefill `compute_us`, callback wall, top-k D2H, H2D, stall, predictor,
+     SSD, hit rate, misses/token, and required experts/callback,
+   - decode TPOT and the same secondary metrics,
+   - correctness result for each guard combination.
+
+7. Keep each new fast path independently gated, for example:
+
+```text
+LLAMA_MOE_PREFILL_MMVQ=1
+LLAMA_MOE_PREFILL_GRAPHS=1
+LLAMA_MOE_PREFILL_FUSION=1
+```
+
+Only use these names after confirming they match the actual implementation
+boundaries. Reuse existing `LLAMA_MOE_SLOT_MMVQ`, `LLAMA_MOE_SLOT_GRAPHS`, or
+`LLAMA_MOE_SLOT_GLU_FUSION` only if the guard semantics stay clear for both
+decode and prefill.
+
+### Acceptance
+
+- The batched streaming chat-prefill issue is either fixed or documented with a
+  narrower root cause and a hard guard that prevents unsafe default use.
+- Raw-completion golden logits pass at the tested larger ubatches.
+- `llama-cli --jinja --reasoning off` chat smoke passes before any larger
+  interactive-chat prefill ubatch becomes default.
+- Any multi-token `.slot` fast path has a synthetic CUDA test with changing
+  slot IDs and slot contents.
+- Prefill `compute_us` and/or TTFT improves versus the Phase H baseline without
+  regressing decode TPOT.
+- Secondary metrics stay within noise or improve: H2D, stall, predictor, SSD,
+  hit rate, misses/token, and required experts/callback.
+- All new prefill compute guards remain independently disableable.
+
+## Phase J - Prefill-Specific Improvements
 
 At 8000 MiB the current slot budget forces effective ubatch 8. Prefill gains
 need either more slots or a different prefill strategy.
@@ -893,7 +982,7 @@ need either more slots or a different prefill strategy.
 - Batched prefill changes pass golden logits and chat smoke before becoming
   defaults.
 
-## Phase J - Validation Matrix
+## Phase K - Validation Matrix
 
 Run after each performance phase, not only at the end.
 
@@ -987,8 +1076,10 @@ Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
 8. Phase G: revalidate decode GLU fusion.
 9. Phase H: treat top-k MoE fusion as a dedicated correctness and decode
    performance issue.
-10. Phase I: tune prefill using cache budget, cold/warm reporting, and optional
-   hot-start.
+10. Phase I: close prefill correctness and multi-token compute fast-path
+    blockers.
+11. Phase J: tune prefill using cache budget, cold/warm reporting, and optional
+    hot-start.
 
 The expected biggest immediate win is Phase B. Until the EAMC lifecycle is
 fixed, decode wall time is dominated by work that the current CSV does not
