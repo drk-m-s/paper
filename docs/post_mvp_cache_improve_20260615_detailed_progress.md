@@ -6,13 +6,15 @@ Implementation repo: `C:\code\llama.cpp.offload`.
 
 ## Scope
 
-This progress entry covers Phase 0 and Phase 1 implementation and validation:
+This progress entry covers Phase 0 through Phase 2 implementation and
+validation:
 
 - Phase 0 diagnostics and offline CSV analysis.
 - Phase 1 EAMC fidelity audit and request-level `eamc-r` support.
+- Phase 2 eviction-only predictor experiments.
 
-It does not implement new eviction policies, true expert prefetch, FineMoE
-ExpertMaps, or CPU DRAM tiering.
+It does not implement true expert prefetch, FineMoE ExpertMaps, or CPU DRAM
+tiering.
 
 ## Code Changes
 
@@ -146,6 +148,45 @@ Extended `tests/moe-offload/test-eamc-cosine.cpp`:
   `EAM2`.
 - Verifies diagnostic `dedupe-nearest` collapses near-identical request rows.
 
+### Phase 2 Eviction Policy Experiments
+
+Added opt-in predictor names:
+
+```text
+--moe-predictor lfu
+--moe-predictor eamc-lfu
+```
+
+`lru` remains the default. No prefetch behavior was added.
+
+Implemented pure LFU:
+
+- Maintains a per-layer visit frequency for `(layer, expert)`.
+- Uses frequency as the keep score.
+- Uses a small LRU recency component only as a tie-break for equal frequency.
+
+Implemented `eamc-lfu`:
+
+- Reuses EAMC-lite prediction and `EAM1` sidecars.
+- Maintains the same per-layer visit frequency.
+- Scores resident experts as:
+
+```text
+keep_score = max(predicted_probability, eps) * max(freq, 1) + lru_tie_break
+```
+
+This keeps the Phase 2 hybrid eviction-only and opt-in. Existing `eamc`,
+`eamc-lite`, and `eamc-r` behavior remains unchanged.
+
+Extended tests:
+
+- Verifies `lfu` parsing and trace metadata.
+- Verifies LFU prefers higher-frequency experts.
+- Verifies LFU uses LRU as the tie-break for equal frequencies.
+- Verifies `eamc-lfu` parsing and trace metadata.
+- Verifies `eamc-lfu` loads `EAM1` sidecars.
+- Verifies `eamc-lfu` multiplies equal EAMC predictions by visit frequency.
+
 ## Files Changed In `llama.cpp.offload`
 
 - `src/moe-offload/predictor.h`
@@ -234,7 +275,7 @@ CLI smoke:
 The help output includes:
 
 ```text
---moe-predictor <lru|eamc|eamc-lite|eamc-r>
+--moe-predictor <lru|lfu|eamc|eamc-lite|eamc-r|eamc-lfu>
 ```
 
 Phase 1 `eamc-r` model smoke:
@@ -270,6 +311,25 @@ Smoke result:
 This smoke is not a Phase 2 performance comparison; it only validates that
 `eamc-r` runs in the real offload runtime, writes `EAM2`, and stays under the
 Phase 1 predictor-overhead gate on the short model run.
+
+Phase 2 analyzer:
+
+```powershell
+python tests\moe-offload\analyze-profile.py `
+  --tokens prefill=256,decode=256 --top 4 `
+  8000-lru=tests\moe-offload\_out\post-cache-p2-20260615-8000-lru-cold-reset.csv `
+  8000-lfu=tests\moe-offload\_out\post-cache-p2-20260615-8000-lfu-cold-reset.csv `
+  8000-eamc-lite=tests\moe-offload\_out\post-cache-p2-20260615-8000-eamc-lite-cold-reset.csv `
+  8000-eamc-r=tests\moe-offload\_out\post-cache-p2-20260615-8000-eamc-r-cold-reset.csv `
+  8000-eamc-lfu=tests\moe-offload\_out\post-cache-p2-20260615-8000-eamc-lfu-cold-reset.csv `
+  12000-lru=tests\moe-offload\_out\post-cache-p2-20260615-12000-lru-cold-reset.csv `
+  12000-lfu=tests\moe-offload\_out\post-cache-p2-20260615-12000-lfu-cold-reset.csv `
+  12000-eamc-r=tests\moe-offload\_out\post-cache-p2-20260615-12000-eamc-r-cold-reset.csv `
+  12000-eamc-lfu=tests\moe-offload\_out\post-cache-p2-20260615-12000-eamc-lfu-cold-reset.csv `
+  > tests\moe-offload\_out\post-cache-p2-20260615-analysis.md
+```
+
+Passed.
 
 ## Phase 0 Benchmark Matrix
 
@@ -360,8 +420,91 @@ The Phase 0 conclusion is therefore:
 2. Treat current EAMC as `eamc-lite`.
 3. Do not implement true prefetch on top of EAMC-lite without first improving
    eviction scoring or adding a paper-faithful request-level predictor.
-4. Phase 2 should start with eviction-only alternatives, especially LFU and
+4. Phase 2 therefore tested eviction-only alternatives, especially LFU and
    EAMC/LFU hybrids, before any speculative SSD prefetch.
+
+## Phase 2 Benchmark Matrix
+
+The required Phase 2 no-prefetch matrix was run on the same model-bearing
+environment:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='0'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='0'
+```
+
+Common benchmark shape:
+
+```text
+--pp 256 --tg 256 --repeat 3 --moe-reset-cache-between-repeats
+```
+
+Artifacts:
+
+- `tests/moe-offload/_out/post-cache-p2-20260615-8000-lru-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-8000-lfu-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-8000-eamc-lite-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-8000-eamc-r-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-8000-eamc-lfu-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-12000-lru-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-12000-lfu-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-12000-eamc-r-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-12000-eamc-lfu-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p2-20260615-analysis.md`
+
+EAMC-family runs used per-run sidecars under `tests/moe-offload/_out/` to avoid
+mutating the model-side sidecar.
+
+### Matrix Results
+
+| Cache | Predictor | Prefill ms/tok | Decode TPOT | Prefill hit | Decode hit | Decode SSD GB | Decode predictor |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8000 MiB | LRU | 24.89 | 31.77 | 80.1% | 91.1% | 38.83 | 0.12 ms/tok |
+| 8000 MiB | LFU | 20.06 | 28.41 | 80.5% | 89.2% | 47.18 | 0.13 ms/tok |
+| 8000 MiB | EAMC-lite | 20.16 | 30.85 | 81.0% | 88.2% | 51.54 | 0.58 ms/tok |
+| 8000 MiB | EAMC-r | 20.03 | 25.76 | 81.0% | 92.1% | 34.54 | 0.15 ms/tok |
+| 8000 MiB | EAMC-LFU | 20.07 | 26.85 | 80.9% | 91.5% | 37.01 | 0.48 ms/tok |
+| 12000 MiB | LRU | 16.09 | 22.42 | 75.1% | 95.3% | 20.24 | 0.07 ms/tok |
+| 12000 MiB | LFU | 15.80 | 21.46 | 75.5% | 95.5% | 19.77 | 0.06 ms/tok |
+| 12000 MiB | EAMC-r | 15.75 | 21.00 | 75.6% | 95.9% | 17.85 | 0.08 ms/tok |
+| 12000 MiB | EAMC-LFU | 15.77 | 21.57 | 75.6% | 95.4% | 19.90 | 0.24 ms/tok |
+
+### Interpretation
+
+Phase 2 acceptance is met by `eamc-r`.
+
+At 8000 MiB:
+
+- `eamc-r` improved decode hit rate over LRU from `91.1%` to `92.1%`.
+- `eamc-r` improved decode TPOT from `31.77 ms/token` to `25.76 ms/token`.
+- `eamc-r` reduced decode SSD reads from `38.83 GB` to `34.54 GB`.
+- `eamc-r` predictor overhead was `0.15 ms/token`, only `0.03 ms/token` above
+  LRU and far below the Phase 1 overhead gate.
+- `eamc-lfu` also beat LRU on decode hit rate and TPOT, but was slower than
+  `eamc-r` and cost more predictor time.
+- LFU was faster than LRU on this run but had worse decode hit rate
+  (`89.2%`), so it does not satisfy the Phase 2 acceptance rule.
+
+At 12000 MiB:
+
+- `eamc-r` improved decode hit rate over LRU from `95.3%` to `95.9%`.
+- `eamc-r` improved decode TPOT from `22.42 ms/token` to `21.00 ms/token`.
+- `eamc-r` reduced decode SSD reads from `20.24 GB` to `17.85 GB`.
+- LFU also beat LRU at 12000 MiB, but `eamc-r` was best on decode hit rate,
+  TPOT, and SSD bytes.
+- `eamc-lfu` remained a valid opt-in experiment, but did not beat `eamc-r`.
+
+The Phase 2 conclusion is therefore:
+
+1. Keep LRU as the default until a broader workload set confirms the new policy.
+2. Use `eamc-r` as the best measured experimental eviction policy and the
+   preferred Phase 3 prefetch base.
+3. Keep `lfu` as a low-overhead baseline.
+4. Keep `eamc-lfu` opt-in, but do not build Phase 3 prefetch around it unless a
+   later corpus shows it beating `eamc-r`.
 
 ## Current Phase 0 Status
 
@@ -395,9 +538,23 @@ Implemented:
 
 Phase 1 is complete.
 
+## Current Phase 2 Status
+
+Implemented:
+
+- per-layer visit-frequency tracking in the predictor layer,
+- pure `lfu` predictor,
+- `eamc-lfu` hybrid predictor,
+- CLI/help wiring for `lfu` and `eamc-lfu`,
+- focused predictor tests for LFU ordering and EAMC/LFU scoring,
+- required no-prefetch benchmark matrix at 8000 MiB and 12000 MiB,
+- analyzer report for the Phase 2 matrix.
+
+Phase 2 is complete.
+
 ## Next Step
 
-Proceed to Phase 2 eviction-only policies. Based on Phase 0 and Phase 1, compare
-`lru`, `eamc-lite`, `eamc-r`, LFU, and EAMC/LFU hybrids before adding true SSD
-prefetch. The first Phase 2 acceptance gate should be beating LRU decode hit
-rate and TPOT under the same 8000 MiB and 12000 MiB matrix.
+Proceed to Phase 3 true prefetch. Use `eamc-r` as the first prefetch base
+because it is the only Phase 2 predictor that clearly beat LRU on decode hit
+rate, TPOT, and SSD bytes at both tested cache sizes. Keep `lru` as the default
+fallback and keep `lfu` / `eamc-lfu` as experimental comparator policies.
