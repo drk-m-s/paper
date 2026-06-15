@@ -80,6 +80,11 @@ Therefore the likely causes of the user-visible gap are:
   `llama-moe-bench` isolates more tightly.
 - The normal runtime profile summary may not expose the same cold/warm and
   prefill/decode breakdowns that `llama-moe-bench` emits.
+- The pre-Phase-G saved fast CLI summary was not an apples-to-apples compare:
+  it used LRU, 31 prompt tokens, and 9 generated tokens, while the Phase K
+  bench reference used EAMC, 256 prompt tokens, 128 generated tokens, and 3
+  repeats. The short interactive turn is therefore dominated by frontend and
+  cold-start effects, not just MoE kernel cost.
 
 ## Non-Goals
 
@@ -395,6 +400,45 @@ Run comparable `llama-moe-bench` and `llama-cli` cases:
   overhead, or the remaining overhead is measured and documented.
 - No correctness regression versus Phase K.
 
+## Phase G - Matched CLI Decode Gap Investigation
+
+The fast CLI path is implemented, but the remaining decode-speed gap still
+needs a workload-matched diagnosis before the closeout can be called done.
+
+### Tasks
+
+1. Run matched `llama-moe-bench` and `llama-cli` cases with the same model,
+   cache budget, predictor, fast-path stack, and a long enough output target to
+   average out startup noise.
+2. Compare prompt token count, generated token count, effective ubatch,
+   TTFT, TPOT, decode hit rate, SSD read, H2D, stall, predictor, callback wall,
+   and unattributed wall time.
+3. Separate MoE execution cost from frontend cost by running a CLI command
+   with `--simple-io`, deterministic sampling, and a sustained generation
+   length.
+4. Record whether the remaining gap is caused by prompt/chat-template shape,
+   predictor choice, cache state, or CLI plumbing above the model loop.
+5. If the gap is still material after matched runs, define the next diagnostic
+   mode for raw CLI completion versus interactive chat.
+
+### Acceptance
+
+- The remaining CLI-vs-bench decode gap is measured with matched workload
+  settings, not inferred from short interactive turns.
+- The progress report records the dominant bucket(s) behind the gap, or states
+  clearly that the remaining delta is frontend and workload dependent.
+- Any follow-on implementation phase is based on those measured results.
+
+Implementation note:
+
+- Matched 12000 MiB runs with the accepted guard stack showed CLI decode TPOT
+  close to bench in both predictor modes: LRU 28.36 ms/token vs 27.26
+  ms/token, and EAMC 34.59 ms/token vs 31.27 ms/token.
+- The remaining delta stayed in the workload/cache-route buckets rather than a
+  missing MoE fast path.
+- No further CLI code change was needed for the final closeout; the fast
+  interactive profile is already in place and behaves as documented.
+
 ## Documentation Requirements
 
 Update these after fixing `llama-cli`:
@@ -429,7 +473,7 @@ The final MVP closeout is complete only when:
    offload speed in interactive chat.
 2. `llama-cli` either matches `llama-moe-bench` within the accepted tolerance
    under comparable settings, or every remaining delta is measured and
-   documented.
+   documented through the matched-workload investigation phase.
 3. The conservative fallback remains available and documented.
 4. Phase K correctness gates still pass.
 5. README wording no longer implies benchmark speeds apply to `llama-cli`

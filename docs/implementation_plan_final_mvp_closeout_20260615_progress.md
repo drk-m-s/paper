@@ -117,3 +117,124 @@ streaming cache, ubatch 8, and 8 predicted tokens.
   that humans can run one documented `llama-cli` command, see effective
   auto-sized ubatch, get coherent chat output, and collect the same category of
   MoE breakdown as the bench report.
+
+## CLI Decode Gap Investigation
+
+The current saved `llama-cli` fast-path run does not prove a decode kernel
+regression. It is not comparable to the Phase K `llama-moe-bench` result:
+
+| Field | `llama-cli` fast smoke | Phase K `llama-moe-bench` |
+| --- | ---: | ---: |
+| Predictor | LRU | EAMC |
+| Prompt tokens | 31 | 256 |
+| Generated tokens | 9 | 128 x 3 repeats |
+| Effective ubatch | 16 | 16 |
+| Decode hit rate | 83.7% | 92.4% |
+| Decode SSD read | 65.39 ms/token | 8.03 ms/token |
+| Decode H2D | 12.62 ms/token | 6.64 ms/token |
+| Decode GPU compute | 12.13 ms/token | 11.16 ms/token |
+| Decode TPOT | 89.15 ms/token | 26.78 ms/token |
+
+Interpretation:
+
+- The `gpu_compute` bucket is close: 12.13 ms/token in CLI versus
+  11.16 ms/token in bench.
+- The large TPOT gap is currently dominated by cache and I/O behavior, not by
+  the guarded decode MMVQ/graph/GLU compute path.
+- The CLI smoke generated only 9 tokens, so per-token wall time is very noisy.
+- The CLI prompt is a Jinja chat prompt plus frontend/server/streaming console
+  path; the bench prompt is a synthetic repeated-text prompt and direct
+  decode loop.
+
+### Matched Results
+
+After rerunning matched 12000 MiB cases with the accepted guard stack and a
+128-token generation budget, the CLI path was close enough to bench to close
+the remaining decode concern:
+
+| Predictor | `llama-moe-bench` TPOT | `llama-cli` TPOT | Notes |
+| --- | ---: | ---: | --- |
+| LRU | 27.26 ms/token | 28.36 ms/token | close match |
+| EAMC | 31.27 ms/token | 34.59 ms/token | still close, but a bit slower |
+
+For the EAMC comparison, the CLI prompt still began from a short interactive
+chat exchange, so some residual difference remains in prompt/cache-route
+behavior. The important closeout result is that the CLI fast profile does reach
+bench-like decode speed when measured on a matched workload.
+
+### Phase G Diagnostic Plan
+
+Run matched workloads before changing more code:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='0'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='0'
+
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 128 --repeat 3 `
+  --moe-cache-vram-mb 12000 --moe-predictor lru `
+  --moe-reset-cache-between-repeats `
+  --moe-profile-csv tests\moe-offload\_out\cli-gap-bench-lru.csv `
+  --moe-profile-summary tests\moe-offload\_out\cli-gap-bench-lru.summary.txt
+```
+
+```powershell
+.\build-moe-static\bin\Release\llama-cli.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --moe-offload --moe-cache-vram-mb 12000 --moe-predictor lru `
+  --moe-fast-paths `
+  --moe-profile-csv tests\moe-offload\_out\cli-gap-cli-lru.csv `
+  --moe-profile-summary tests\moe-offload\_out\cli-gap-cli-lru.summary.txt `
+  --jinja --reasoning off --temp 0 --seed 42 --simple-io --no-warmup `
+  -c 4096 -n 128 -sys "You are a helpful assistant."
+```
+
+Feed a prompt that is likely to produce the full 128-token budget, then `/exit`.
+Repeat the pair with `--moe-predictor eamc`.
+
+Acceptance for the investigation:
+
+- Compare only runs with the same cache budget, predictor, guard stack, cache
+  reset/warm policy, and comparable generated-token count.
+- If CLI `gpu_compute`, H2D, stall, and predictor are close but TPOT is still
+  worse, treat the remaining gap as frontend, cache-route, or prompt-shape
+  overhead and document the bucket.
+- If CLI MoE profile buckets are worse under matched settings, open the next
+  implementation phase against the specific bucket rather than treating the
+  whole CLI as slow.
+
+### Phase G Outcome
+
+No additional code fix was required beyond the existing fast CLI profile and
+profile-summary plumbing. The closeout now treats the remaining difference as a
+workload/cache-route effect rather than a CLI performance bug.
+
+Final validation after Phase G:
+
+```powershell
+ctest --test-dir build-moe-static -C Release -L moe-offload --output-on-failure
+```
+
+Passed: 8/8 tests.
+
+```powershell
+$env:LLAMA_MOE_FAST_PATHS='1'
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-cli.exe" `
+  -CacheMb 12000 -Predictor lru -NPredict 64 -StreamingUBatch 0
+```
+
+Passed: formatted `llama-cli` chat smoke.
+
+Documentation updated:
+
+- `docs/moe-offload/README.md` now reports the matched Phase G CLI-vs-bench
+  decode numbers and explains how to compare TPOT fairly.
+- `docs/moe-offload/known-issues.md` now records that the fast profile reaches
+  bench-like decode speed under matched settings and keeps only the short-chat
+  measurement caveat.
