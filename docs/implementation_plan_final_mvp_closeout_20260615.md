@@ -54,10 +54,13 @@ if (params.moe_offload && std::getenv("LLAMA_MOE_STREAMING_UBATCH") == nullptr) 
 }
 ```
 
-That guard was added for correctness-first interactive chat behavior. It is
-also the most likely reason `llama-cli` does not show the same prefill speed as
-`llama-moe-bench`, because the Phase K recommendation uses 12000 MiB cache and
-effective ubatch 16.
+That guard was added for correctness-first interactive chat behavior. It
+explains why an ordinary pre-closeout `llama-cli --moe-offload` command did not
+use the validated fast profile by default: the Phase K recommendation uses
+12000 MiB cache, the accepted fast-path guard stack, and effective ubatch 16.
+Later Phase G prefill diagnostics found that the remaining prefill delta under
+the fast CLI profile is dominated by prompt length, expert locality, cache
+state, and repeat policy rather than a missing CLI fast path.
 
 `llama-moe-bench` closeout numbers also assume an accepted guard stack that is
 not automatically enabled by ordinary `llama-cli` commands:
@@ -70,7 +73,7 @@ $env:LLAMA_MOE_SLOT_GLU_FUSION='1'
 $env:LLAMA_MOE_TOPK_FUSION_DIAG='0'
 ```
 
-Therefore the likely causes of the user-visible gap are:
+Therefore the causes to diagnose before claiming a CLI bug are:
 
 - CLI forces ubatch 1 by default.
 - CLI users do not know they must enable the accepted fast-path guards.
@@ -344,7 +347,7 @@ $env:LLAMA_MOE_STREAMING_UBATCH='1'
   vars.
 - The output is coherent on the existing chat-smoke prompts.
 - Prefill and decode speeds are visibly closer to bench results than the
-  current default CLI path.
+  conservative default CLI path.
 - If CLI wall time still trails bench, the remaining delta is measured and
   documented.
 

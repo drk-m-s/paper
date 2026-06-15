@@ -271,7 +271,7 @@ Passed: formatted `llama-cli` chat smoke.
 Documentation updated:
 
 - `docs/moe-offload/README.md` now reports the matched Phase G CLI-vs-bench
-  decode numbers and explains how to compare TPOT fairly.
+  decode numbers and explains how to compare TPOT and prefill fairly.
 - `docs/moe-offload/known-issues.md` now records that the fast profile reaches
-  bench-like decode speed under matched settings and keeps only the short-chat
-  measurement caveat.
+  bench-like decode speed under matched settings, and records the prefill
+  workload/locality caveat instead of treating it as a CLI-specific regression.
