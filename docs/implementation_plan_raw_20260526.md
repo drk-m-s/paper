@@ -51,4 +51,5 @@ Train a lightweight prediction model or a small neural network to predict expert
 - "ExpertFlow", the coordinated combination of a T5-style routing predictor, routing-aware token rebatching, predictive locality-aware caching, and runtime correction for mispredictions.
 
 
-
+## Sixth implementation area to explore:
+KV-compression to allow larger context size, this includes investigating exising implementations of Turbo-Quant.
