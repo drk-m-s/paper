@@ -439,6 +439,18 @@ Implementation note:
 - No further CLI code change was needed for the final closeout; the fast
   interactive profile is already in place and behaves as documented.
 
+Prefill follow-up:
+
+- The apparent CLI prefill gap was also workload-shaped, not a missing CLI fast
+  path. The 51-token chat prompt had low locality and only 41.7% prefill hit
+  rate, so it reported 71.70 ms/token. A short raw `llama-moe-bench` prompt was
+  similarly slow at 76.95 ms/token with 24.0% prefill hit rate.
+- With a long repeated chat prompt, `llama-cli` reached 21.87 ms/token at
+  269 prompt tokens and 80.3% prefill hit rate, comparable to the synthetic
+  repeated bench prompt.
+- `LLAMA_MOE_PREFILL_MMVQ=1` was tested but not promoted: it reduced short CLI
+  TTFT only slightly and regressed decode TPOT.
+
 ## Documentation Requirements
 
 Update these after fixing `llama-cli`:
@@ -472,8 +484,8 @@ The final MVP closeout is complete only when:
 1. Humans have a documented fast `llama-cli` command that demonstrates MoE
    offload speed in interactive chat.
 2. `llama-cli` either matches `llama-moe-bench` within the accepted tolerance
-   under comparable settings, or every remaining delta is measured and
-   documented through the matched-workload investigation phase.
+   under comparable prefill and decode settings, or every remaining delta is
+   measured and documented through the matched-workload investigation phase.
 3. The conservative fallback remains available and documented.
 4. Phase K correctness gates still pass.
 5. README wording no longer implies benchmark speeds apply to `llama-cli`

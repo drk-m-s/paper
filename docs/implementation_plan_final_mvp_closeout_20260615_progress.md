@@ -213,6 +213,43 @@ No additional code fix was required beyond the existing fast CLI profile and
 profile-summary plumbing. The closeout now treats the remaining difference as a
 workload/cache-route effect rather than a CLI performance bug.
 
+## CLI Prefill Gap Investigation
+
+The same workload-matching issue affected prefill. The apparent CLI prefill
+gap came from comparing a short chat prompt against the synthetic repeated
+bench prompt.
+
+Measured 12000 MiB LRU cases with the accepted guard stack:
+
+| Case | Prompt tokens | Prefill TPOT | Prefill hit rate | Artifact |
+| --- | ---: | ---: | ---: | --- |
+| Short raw bench prompt | 27 | 76.95 ms/token | 24.0% | `cli-prefill-bench-lru-shortprompt.summary.txt` |
+| Short CLI chat prompt | 51 | 71.70 ms/token | 41.7% | `cli-gap-cli-lru.summary.txt` |
+| Long repeated CLI chat prompt | 269 | 21.87 ms/token | 80.3% | `cli-prefill-cli-lru-longhello.summary.txt` |
+| Single-repeat repeated bench prompt | 256 | 28.30 ms/token | 75.1% | `cli-prefill-bench-lru-pp256.summary.txt` |
+
+Interpretation:
+
+- Short prompts are slow per token in both tools because cold slot loads are
+  not amortized and the prompt has lower expert locality.
+- The long repeated CLI prompt reaches the same class of prefill speed as the
+  repeated bench prompt.
+- The faster repeat-averaged benchmark prefill number should not be used as
+  the expected speed for a first-turn short chat prompt.
+
+Experimental prefill MMVQ check:
+
+- `LLAMA_MOE_PREFILL_MMVQ=1` reduced the short CLI TTFT from 3656.9 ms to
+  3534.9 ms, but decode TPOT worsened from 28.36 to 30.50 ms/token.
+- This is not a safe final-MVP default, so `--moe-fast-paths` continues to
+  force `LLAMA_MOE_PREFILL_MMVQ=0`.
+
+Outcome:
+
+- No CLI code fix was needed for prefill parity under matched workload.
+- Documentation now tells users to compare prefill with matched prompt length,
+  prompt locality, cache state, and repeat policy.
+
 Final validation after Phase G:
 
 ```powershell
