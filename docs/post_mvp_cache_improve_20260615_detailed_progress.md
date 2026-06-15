@@ -6,10 +6,10 @@ Implementation repo: `C:\code\llama.cpp.offload`.
 
 ## Scope
 
-This progress entry covers Phase 0 and Phase 1 implementation scaffolding:
+This progress entry covers Phase 0 and Phase 1 implementation and validation:
 
 - Phase 0 diagnostics and offline CSV analysis.
-- Phase 1 EAMC fidelity audit foundations.
+- Phase 1 EAMC fidelity audit and request-level `eamc-r` support.
 
 It does not implement new eviction policies, true expert prefetch, FineMoE
 ExpertMaps, or CPU DRAM tiering.
@@ -71,7 +71,7 @@ Added explicit predictor trace metadata:
 - `predictor_trace_stats`
 - `predictor::trace_stats()`
 
-The current EAMC predictor now reports:
+The compatibility EAMC predictor reports:
 
 ```text
 trace_scope = iteration-batch-eam-v1
@@ -80,17 +80,48 @@ sidecar_phase_tagged = false
 request_level_rows = false
 ```
 
-This intentionally documents the current behavior as MVP EAMC-lite rather than
-paper-complete MoE-Infinity request-level EAMC.
+This documents the current `eamc` behavior as MVP EAMC-lite rather than
+MoE-Infinity request-level EAMC. `eamc-lite` is now an explicit alias for this
+compatibility behavior, and `eamc` remains accepted for existing scripts and
+sidecars.
 
-Added an explicit predictor alias:
+Added a request-level predictor mode:
 
 ```text
---moe-predictor eamc-lite
+--moe-predictor eamc-r
 ```
 
-`eamc` remains accepted for compatibility. The alias is accepted by common args,
-`llama-moe-bench`, and `llama-bench`.
+`eamc-r` uses the new predictor sequence/iteration API:
+
+```cpp
+begin_sequence_or_turn();
+begin_iteration(phase, token_count);
+observe(layer, experts_used);
+score(layer, expert);
+end_iteration();
+end_sequence_or_turn();
+```
+
+Runtime wiring now opens predictor iterations from the actual MoE callback phase
+(`prefill` or `decode`). A prefill batch starts a new request-level sequence;
+decode batches accumulate into that sequence until the next prefill, cache reset,
+or predictor flush. This keeps `eamc`/`eamc-lite` as iteration-batch EAM1 while
+allowing `eamc-r` to store request-level rows.
+
+Added an `EAM2` sidecar format for `eamc-r`:
+
+- Keeps the existing shape/capacity/top-k header.
+- Adds replacement-policy metadata.
+- Stores a per-row phase tag before each dense row.
+- Loads existing `EAM1` sidecars as unknown-phase history.
+- Saves `eamc-r` corpora as `EAM2`.
+
+Replacement policy status:
+
+- `fifo` remains the default for compatibility.
+- `dedupe-nearest` is available behind diagnostic env var
+  `LLAMA_MOE_EAMC_REPLACE=dedupe-nearest`.
+- No default replacement behavior was changed for Phase 1.
 
 Extended `tests/moe-offload/test-eamc-cosine.cpp`:
 
@@ -101,15 +132,25 @@ Extended `tests/moe-offload/test-eamc-cosine.cpp`:
 - Verifies `eamc-lite` parses as an alias.
 - Adds an audit test showing two `begin_request()/end_request()` intervals
   produce two `EAM1` rows, not one accumulated request-level row.
-
-No `EAM2` sidecar was added because runtime row semantics were not changed in
-this phase. The next implementation phase can add `EAM2` when request-level
-rEAM storage is actually introduced.
+- Verifies `eamc-r` reports request-level `EAM2` metadata.
+- Verifies one request with multiple decode iterations produces one decode rEAM
+  row.
+- Verifies separate request sequences produce separate rows.
+- Verifies prefill/decode observations are stored as separate phase-tagged
+  rows.
+- Verifies partial current decode iEAM scores against historical request-level
+  rEAM rows.
+- Verifies `EAM2` round-trip preserves version, phases, row count, capacity,
+  top-k, and dense values.
+- Verifies `eamc-r` loads legacy `EAM1` sidecars and upgrades saved output to
+  `EAM2`.
+- Verifies diagnostic `dedupe-nearest` collapses near-identical request rows.
 
 ## Files Changed In `llama.cpp.offload`
 
 - `src/moe-offload/predictor.h`
 - `src/moe-offload/predictor.cpp`
+- `src/moe-offload/loader.cpp`
 - `src/moe-offload/profiler.h`
 - `src/moe-offload/profiler.cpp`
 - `src/moe-offload/slot_pool.cpp`
@@ -153,20 +194,22 @@ Focused build:
 
 ```powershell
 cmake --build build-moe-static --config Release --target `
-  test-eamc-cosine test-lru-eviction llama-moe-bench -j 8
+  test-eamc-cosine -j 8
+
+cmake --build build-moe-static --config Release --target `
+  test-lru-eviction llama-moe-bench llama-bench llama-cli -j 8
 ```
 
-Passed. Existing MSVC/link warnings were unchanged:
+Passed. Existing MSVC link warnings were unchanged:
 
-- `C4244` in `llama-graph.cpp`
-- `LNK4098` static CRT conflict on `llama-moe-bench`
+- `LNK4098` static CRT conflict on `llama-moe-bench`, `llama-bench`, and
+  `llama-cli`
 
 Focused tests:
 
 ```powershell
 .\build-moe-static\bin\Release\test-eamc-cosine.exe
 .\build-moe-static\bin\Release\test-lru-eviction.exe
-ctest --test-dir build-moe-static -C Release -R "test-eamc-cosine|test-lru-eviction" --output-on-failure
 ```
 
 Passed.
@@ -179,13 +222,54 @@ ctest --test-dir build-moe-static -C Release -L moe-offload --output-on-failure
 
 Passed: 8/8 tests.
 
-CLI rebuild after common-arg changes:
+CLI smoke:
 
 ```powershell
-cmake --build build-moe-static --config Release --target llama-cli -j 8
+.\build-moe-static\bin\Release\llama-bench.exe --help |
+  Select-String -Pattern "moe-predictor"
+
+.\build-moe-static\bin\Release\llama-moe-bench.exe --help
 ```
 
-Passed, with the existing `LNK4098` static CRT warning.
+The help output includes:
+
+```text
+--moe-predictor <lru|eamc|eamc-lite|eamc-r>
+```
+
+Phase 1 `eamc-r` model smoke:
+
+```powershell
+.\build-moe-static\bin\Release\llama-moe-bench.exe `
+  --model C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 32 --tg 8 --repeat 1 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc-r `
+  --moe-eamc-path tests\moe-offload\_out\phase1-eamc-r-smoke.eamc `
+  --moe-profile-csv tests\moe-offload\_out\phase1-eamc-r-smoke.csv `
+  --moe-profile-summary tests\moe-offload\_out\phase1-eamc-r-smoke.summary.txt `
+  -ub 8
+```
+
+Passed. Artifacts:
+
+- `tests/moe-offload/_out/phase1-eamc-r-smoke.eamc`
+- `tests/moe-offload/_out/phase1-eamc-r-smoke.csv`
+- `tests/moe-offload/_out/phase1-eamc-r-smoke.summary.txt`
+
+Smoke result:
+
+- `predictor: eamc-r`
+- prefill predictor cost: `0.01 ms/token`
+- decode predictor cost: `0.01 ms/token`
+- sidecar magic: `EAM2`
+- sidecar rows: `2`
+- sidecar phases: `1` (`prefill`) and `2` (`decode`)
+- sidecar shape: `40` layers x `256` experts, `capacity=1024`, `top_k=8`
+
+This smoke is not a Phase 2 performance comparison; it only validates that
+`eamc-r` runs in the real offload runtime, writes `EAM2`, and stays under the
+Phase 1 predictor-overhead gate on the short model run.
 
 ## Phase 0 Benchmark Matrix
 
@@ -297,20 +381,23 @@ Phase 0 is complete.
 Implemented:
 
 - explicit EAMC-lite semantics in code metadata,
-- `eamc-lite` alias,
-- tests locking down that current `EAM1` rows are not request-level rEAM rows,
-- compatibility preserved for existing `eamc` and `EAM1` sidecars.
+- `eamc-lite` compatibility alias,
+- `eamc-r` request-level predictor mode,
+- sequence/turn and iteration-level predictor API,
+- live runtime phase-aware predictor iteration wiring,
+- `EAM2` request-level sidecar with phase tags and replacement-policy
+  metadata,
+- `EAM1` load compatibility for `eamc` and `eamc-r`,
+- FIFO default replacement preserved,
+- diagnostic `dedupe-nearest` replacement policy,
+- tests locking down both EAMC-lite and request-level `eamc-r` semantics,
+- model smoke validating `eamc-r` runtime execution and `EAM2` output.
 
-Deferred:
-
-- `EAM2` request-level rEAM sidecar,
-- sequence/turn-level predictor API in live runtime,
-- paper-faithful `eamc-r` predictor mode,
-- dedupe/diverse EAMC replacement policy.
+Phase 1 is complete.
 
 ## Next Step
 
-Proceed to Phase 2 eviction-only policies. Based on Phase 0, start with LFU and
-EAMC/LFU hybrids rather than true SSD prefetch. The first Phase 2 acceptance
-gate should be beating LRU decode hit rate and TPOT under the same 8000 MiB and
-12000 MiB matrix.
+Proceed to Phase 2 eviction-only policies. Based on Phase 0 and Phase 1, compare
+`lru`, `eamc-lite`, `eamc-r`, LFU, and EAMC/LFU hybrids before adding true SSD
+prefetch. The first Phase 2 acceptance gate should be beating LRU decode hit
+rate and TPOT under the same 8000 MiB and 12000 MiB matrix.
