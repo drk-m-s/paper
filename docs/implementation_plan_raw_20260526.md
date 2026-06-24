@@ -25,11 +25,11 @@ A profiling code needs to be established alongside the implementation, it needs 
 ## Second implementation area to explore:
 Main "MoE Infinity" first implementation architecture but improve the following areas:
 - Use GPU VRAM + CPU DRAM + SSD together. Add a new expert cache pool in CPU DRAM to speed up inference, because reading from SSD is much slower than reading from DRAM. Make the CPU DRAM option a new parameter as well to specify how much CPU DRAM should be used.
-- Add an offline profiling phase such as in "Fiddler" or "DALI" or "PowerInfer" to identify hot experts to be loaded at initiation. 
-
-Additionally:
 - Thoroughly understand the paper "FineMoE". Incorporate granularity, prefetch policy, eviction policy, etc, which has stronger results compared with MoE-infinity.
 - Thoroughly understand the paper "ADEPT" and Incoporate improvements made in "ADEPT".
+
+Additionally:
+- Add an offline profiling phase such as in "Fiddler" or "DALI" or "PowerInfer" to identify hot experts to be loaded at initiation. 
 
 
 ## Third implementation areas to explore:
@@ -51,4 +51,5 @@ Train a lightweight prediction model or a small neural network to predict expert
 - "ExpertFlow", the coordinated combination of a T5-style routing predictor, routing-aware token rebatching, predictive locality-aware caching, and runtime correction for mispredictions.
 
 
-
+## Sixth implementation area to explore:
+KV-compression to allow larger context size, this includes investigating exising implementations of Turbo-Quant.

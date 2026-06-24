@@ -1,0 +1,1176 @@
+# MoE Offload Performance Plan (2026-06-11)
+
+Repository under work: `C:\code\llama.cpp.offload`.
+
+This plan follows the MVP state where `llama-cli` and the benchmark path can
+run streaming MoE offload. It focuses on improving prefill and decode
+performance without relaxing the current correctness gates.
+
+## Inputs Reviewed
+
+- `docs/moe-offload/README.md`
+- `docs/moe-offload/known-issues.md`
+- `paper/docs/implementation_plan_raw_20260526.md`
+- `paper/docs/implementation_plan_mvp_20260609.md`
+- `paper/docs/implementation_plan_mvp_20260609_progress.md`
+- `paper/docs/implementation_plan_mvp_20260609_llama_cli_moe_chat_progress.md`
+- `moe-summary.txt`
+- `moe-profile.csv`
+- Relevant runtime code in:
+  - `src/moe-offload/predictor.cpp`
+  - `src/moe-offload/slot_pool.cpp`
+  - `src/moe-offload/io.cpp`
+  - `src/moe-offload/profiler.cpp`
+  - `tools/llama-bench/llama-bench.cpp`
+  - `tools/moe-bench/main.cpp`
+  - `ggml/src/ggml-cuda/ggml-cuda.cu`
+
+## Current Profile
+
+The current `moe-summary.txt` reports:
+
+```text
+model: qwen35moe 35B.A3B Q4_K - Medium
+predictor: eamc
+cache: 8000 MB
+n_prompt: 256
+n_gen: 256
+repeats: 3
+ubatch: requested=512 effective=8
+slots=96/256
+mode=streaming
+
+prefill: 33646.2 ms, 8 tok/s
+decode: 1839318.6 ms, 7184.84 ms/token
+```
+
+CSV aggregate across all repeats:
+
+| Phase | Rows | Hit rate | Misses | SSD read | H2D | Compute | Stall | Predictor |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| prefill | 3840 | 80.1% | 48800 | 33.15 s | 14.89 s | 18.28 s | 27.26 s | 24.40 s |
+| decode | 30720 | 88.8% | 27594 | 13.46 s | 33.47 s | 94.45 s | 41.64 s | 102.61 s |
+
+Decode means per generated token across 3 repeats:
+
+| Metric | Mean |
+| --- | ---: |
+| misses | 35.9 experts/token |
+| SSD read | 17.53 ms/token |
+| H2D | 43.59 ms/token |
+| compute | 122.98 ms/token |
+| stall | 54.22 ms/token |
+| predictor row time | 133.61 ms/token |
+| visible CSV columns total | 371.91 ms/token |
+| summary wall TPOT | 7184.84 ms/token |
+
+The wall TPOT is far larger than the CSV columns. That gap is a diagnosis
+target, not noise.
+
+## Diagnosis
+
+### 1. EAMC Finalization and Persistence Are the First Decode Bottleneck
+
+The current run used `--moe-predictor eamc` with the default sidecar:
+
+```text
+C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.eamc
+```
+
+The file is already at full EAMC capacity:
+
+```text
+size: 41943076 bytes
+row bytes: 40 layers * 256 experts * sizeof(float) = 40960
+rows: 1024
+header: 36 bytes
+```
+
+Two implementation details make this extremely expensive:
+
+1. `llama_decode()` calls `llama_moe::begin_request()` and
+   `llama_moe::end_request()` for every prefill/decode batch.
+2. `slot_pool_end_request()` calls `s.pred->end_request()` and then saves the
+   EAMC sidecar on every batch when `opts.eamc_path` is set.
+
+For EAMC, `end_request()` appends the current activation row. Once the corpus
+is full, it calls `evict_redundant()`, which is O(capacity^2 * row_size). With
+capacity 1024 and row size 10240 floats, this can dominate every token.
+
+The code also saves the 40 MiB sidecar after every token. This write cost and
+the EAMC `end_request()` cost are not represented by per-layer CSV `pred_us`.
+This explains why the CSV-visible decode work is about 372 ms/token while the
+summary wall TPOT is about 7185 ms/token.
+
+There is also a lifecycle bug: `configure_slot_pool()` calls
+`s.pred->begin_request()` once, but `llama_moe::begin_request()` does not reset
+the slot-pool predictor state before each `llama_decode()`. EAMC `current`
+therefore accumulates across batches until process teardown instead of
+representing one request window.
+
+### 2. EAMC Scoring Is Also Expensive Inside the CSV
+
+Even before the hidden `end_request()`/save cost, decode spends 102.61 s in
+per-layer predictor row time across the run, or 133.61 ms/token.
+
+Rows with no miss have near-zero `pred_us`. Rows with misses average:
+
+```text
+avg miss row: 1.81 misses
+avg predictor: 6.73 ms/layer
+avg stall: 2.73 ms/layer
+```
+
+The cause is `eamc_predictor::nearest_neighbors()`. It recomputes dense partial
+cosines over up to 1024 corpus rows, scanning `0..current_layer` and all 256
+experts per layer. That is repeated once per layer when eviction scoring first
+needs a score.
+
+The current cache avoids recomputing nearest-neighbor ranking for every
+candidate expert inside one callback, but it still recomputes a dense ranking
+for many callbacks.
+
+### 3. H2D and Stall Are Larger Than SSD Read Time
+
+Decode reads about 48.84 GiB from SSD across 768 generated tokens:
+
+```text
+65.12 MiB/token
+SSD read: 17.53 ms/token
+H2D: 43.59 ms/token
+stall: 54.22 ms/token
+```
+
+The SSD path is not the only problem. H2D throughput is roughly 1.5 GiB/s from
+the profile, which is far below the 8 GB/s target link budget. The current
+callback does:
+
+1. worker reads into pinned memory,
+2. worker queues `cudaMemcpyAsync` on the MoE H2D stream,
+3. callback inserts `cudaStreamWaitEvent()` on the compute stream,
+4. callback immediately calls `io_event_sync()` before releasing the pinned
+   buffer.
+
+Step 4 preserves buffer lifetime but also blocks the host on every H2D event,
+reducing overlap and inflating `stall_us`.
+
+### 4. CUDA Compute Is Still Correctness-First
+
+Known issues document two intentional performance guards:
+
+- CUDA top-k MoE fusion is disabled for `LLAMA_MOE_OFFLOAD`.
+- CUDA `MUL_MAT_ID` on `.slot` tensors bypasses specialized MMVQ/MMQ/MMF
+  paths and uses the generic sorted path.
+
+The profile shows decode `compute_us` at 122.98 ms/token. Restoring the
+specialized decode path after targeted validation is a major performance
+opportunity, but it must come after the EAMC lifecycle fix and H2D overlap fix
+so correctness regressions are easier to isolate.
+
+### 5. Prefill Is Slot-Budget Limited at 8 GiB
+
+The benchmark requested `n_ubatch=512`, but streaming auto-sizing lowered the
+effective value to 8:
+
+```text
+slots=96
+top_k=8
+effective ubatch=8
+```
+
+At this cache size, requesting 512 cannot improve prefill. Larger effective
+ubatches need either:
+
+- more expert-cache VRAM, for example 12000 MiB gives more slots and can reach
+  effective ubatch 16 in the current policy, or
+- an internal layer-wise sub-batching strategy that can process a larger
+  prompt microbatch while keeping each MoE callback's unique expert set within
+  the slot budget.
+
+The first prefill callback is also a cold-start worst case:
+
+```text
+token_idx=0 prefill group: 2560 misses across 40 layers
+```
+
+The benchmark repeats do not reset the MoE slot cache between repeats, so
+current summary numbers mix cold-cache and warm-cache behavior. Future
+benchmark output should report those separately.
+
+### 6. Batched Chat Prefill Is Still a Correctness Risk
+
+`docs/moe-offload/known-issues.md` records that batched streaming prefill can
+corrupt Qwen chat logits. `llama-cli --moe-offload` therefore defaults to
+`n_ubatch=1` unless `LLAMA_MOE_STREAMING_UBATCH` is explicitly set.
+
+Performance work can use `llama-moe-bench` and `llama-completion` with larger
+ubatches, but any change that affects chat prefill must pass the chat smoke
+and golden-logit gates before changing the `llama-cli` default.
+
+## Goals
+
+1. Remove hidden per-token EAMC persistence and expensive full-corpus eviction
+   cost from inference while keeping online EAMC updates.
+2. Make the profiler account for predictor finalization, sidecar writes, and
+   unattributed wall time.
+3. Reduce EAMC scoring overhead enough that it can be compared fairly with
+   LRU.
+4. Improve H2D overlap by preserving pinned-buffer lifetime without host
+   synchronizing every copy.
+5. Restore safe CUDA `.slot` fast paths behind validation gates.
+6. Separate cold-cache and warm-cache prefill measurements.
+
+## Non-Goals
+
+- Do not add CPU DRAM expert tier in this plan.
+- Do not add direct I/O in this plan.
+- Do not add multi-GPU support in this plan.
+- Do not add speculative decoding in this plan.
+- Do not replace EAMC with a new learned predictor in this plan.
+- Do not change `llama-cli` back to batched prefill until the known correctness
+  issue is closed.
+
+## Phase A - Profiler and Benchmark Calibration
+
+Add enough instrumentation to make wall time explainable.
+
+### Changes
+
+1. Add request-level timing fields around `llama_moe::end_request()`:
+   - `predictor_end_us`
+   - `predictor_save_us`
+   - `sidecar_write_bytes`
+   - `profile_flush_us`
+
+2. Add callback-level fields:
+   - `callback_wall_us`
+   - `topk_d2h_us`
+   - `slot_ids_h2d_us`
+   - `slot_table_h2d_us`
+   - split `pred_us` into `pred_observe_us` and `pred_score_us`
+
+3. Add summary gap reporting:
+
+```text
+wall_decode_us
+profiled_decode_us
+unattributed_decode_us
+```
+
+4. Add repeat/request identifiers to the CSV:
+   - `request_idx`
+   - `repeat_idx`
+   - `batch_idx`
+
+5. Add benchmark controls:
+   - `--moe-reset-cache-between-repeats`
+   - `--moe-warm-cache`
+   - explicit summary labels for cold vs warm prefill
+
+### Acceptance
+
+- The current EAMC run shows the missing wall time under
+  `predictor_end_us`, `predictor_save_us`, or `unattributed_decode_us`.
+- A 1-token decode profile can be reconciled to within 10% of wall time.
+- CSV rows can be grouped by benchmark repeat without inferring from
+  `token_idx`.
+
+## Phase B - Keep EAMC Online, Defer Persistence
+
+Status: implemented and validated on 2026-06-11. The 8000 MiB EAMC benchmark
+improved decode TPOT from 7184.84 ms/token to 162.66 ms/token, with
+`predictor_save_us=0` and `sidecar_write_bytes=0` on all per-token decode
+request rows. One sidecar save occurred at benchmark end.
+
+EAMC should keep updating online during inference so it can preserve any cache
+hit-rate benefit from recent expert-activation history. The performance bug is
+that online update, corpus eviction, and persistent sidecar save are currently
+all tied to the per-token hot path. Phase B separates those concerns:
+
+- update EAMC in DRAM during inference,
+- use cheap bounded in-memory corpus management,
+- save the sidecar only at logical user request end or session/context end,
+- never rewrite the sidecar after every generated token.
+
+### Changes
+
+1. Add a predictor lifecycle call from `llama_moe::begin_request()` into the
+   slot pool so EAMC's current activation row is reset at the start of each
+   `llama_decode()` request. This fixes the current lifecycle bug where the
+   row can accumulate across batches.
+
+2. Keep `--moe-predictor eamc` semantically online:
+   - loaded sidecar rows are available for scoring,
+   - new request rows are appended to an in-memory corpus,
+   - current-request observations can influence later eviction decisions,
+   - no user-facing read-only/update mode is added in this phase.
+
+3. Stop saving the EAMC sidecar from every `slot_pool_end_request()`.
+   Replace it with an explicit flush point:
+   - `llama-moe-bench` flushes once after all measured repeats complete,
+   - normal runtime flushes when the context/session is destroyed,
+   - server/chat integrations can call the same flush helper at logical user
+     request end if they want persistence before session teardown.
+
+   In this phase, "request end" means the end of a logical generation/chat
+   request, not the end of each internal `llama_decode()` batch.
+
+4. Add a narrow API:
+
+```cpp
+bool llama_moe::flush_predictor();
+```
+
+   Behavior:
+   - no-op for LRU,
+   - for EAMC, save the current in-memory corpus to `opts.eamc_path`,
+   - return success/failure so benchmark tools can report save errors.
+
+5. Replace online `evict_redundant()` with a cheap bounded policy:
+   - use FIFO/ring replacement when corpus capacity is full,
+   - keep the dense sidecar file format initially for compatibility,
+   - move expensive redundancy pruning to a future offline compaction tool.
+
+6. Keep Phase A request metrics:
+   - `predictor_end_us` should include cheap in-memory row append only,
+   - `predictor_save_us` should be zero for per-token decode requests,
+   - sidecar bytes should be written only at explicit flush.
+
+7. Add tests:
+   - EAMC appends online rows in memory across decode requests.
+   - Full-capacity EAMC uses ring/FIFO replacement without O(capacity^2)
+     redundancy pruning.
+   - A decode request with `--moe-predictor eamc --moe-eamc-path PATH` does
+     not change `PATH` mtime.
+   - `flush_predictor()` writes `PATH` and updates its mtime.
+   - `llama-moe-bench` saves EAMC once at benchmark end when an EAMC path is
+     configured.
+
+### Acceptance
+
+- With the same 8000 MiB cache and sidecar, decode TPOT drops from seconds per
+  token to the range explained by per-layer CSV timers.
+- Sidecar file mtime is unchanged during token generation and changes only at
+  explicit flush/session end.
+- `predictor_save_us` is zero on per-token decode request rows.
+- `predictor_end_us` is bounded and no longer runs O(capacity^2) redundancy
+  pruning.
+- EAMC hit rate is compared before/after Phase B to verify that online DRAM
+  updates preserve or improve cache behavior.
+
+## Phase C - Optimize EAMC Scoring
+
+After Phase B, EAMC scoring still costs about 90.54 ms/token in the 8000 MiB,
+256 prompt, 256 decode benchmark. Make it cheap enough to be a real predictor
+option without reducing EAMC cache hit rate.
+
+Phase C must be semantics-preserving first. The current EAMC scoring behavior
+is slow, but it is also the reason EAMC beats the old run's hit rate. Do not
+start by shrinking or approximating the corpus. First make the same scoring
+cheaper; only then test approximate row caps as an opt-in experiment.
+
+Current measured cost:
+
+- prefill EAMC score time: about 25.9 s across the 256-token, 3-repeat run,
+- decode EAMC score time: about 69.5 s across the 256-token, 3-repeat run,
+- decode predictor cost: 90.54 ms/token,
+- `pred_observe_us` and `predictor_end_us` are already negligible.
+
+Important prefill detail: one outer prefill `llama_decode()` contains multiple
+internal MoE callback waves because effective ubatch is 8. The callback order is
+`L0..L39` for token index 0, then `L0..L39` for token index 8, and so on. Any
+incremental EAMC state must handle this non-monotonic layer order instead of
+assuming layers only advance once from 0 to the final layer.
+
+### Changes
+
+#### C1 - Sparse Representation With Dense-Equivalent Scores
+
+1. Store activation rows sparsely while preserving the existing scoring
+   semantics:
+   - per layer, only activated expert ids and counts,
+   - counts remain callback-observation counts, not per-token frequencies,
+   - loaded dense sidecar rows are converted to sparse rows once at load time,
+   - saving still writes the existing dense sidecar format for compatibility.
+
+2. Precompute sparse row metadata:
+   - full row norm,
+   - per-layer squared norm contribution,
+   - prefix norm for `0..L` lookup,
+   - optional per-layer sorted expert/count vectors for deterministic tests.
+
+3. Keep dense-equivalent cosine behavior for the uncapped path:
+   - for a prefix ending at layer `L`, compute dot products only over current
+     sparse activations and matching corpus layer entries,
+   - use corpus prefix norms equivalent to the dense implementation's
+     `cosine_partial()`,
+   - preserve zero-weight fallback to LRU recency when EAMC weights are zero.
+
+4. Add tests comparing old dense scoring to new sparse scoring:
+   - synthetic deterministic corpora,
+   - repeated observations in the same layer,
+   - partial-prefix scoring,
+   - prefill-like non-monotonic callback order: `L0..L39`, then `L0..L39`
+     again in the same request,
+   - loaded sidecar -> sparse conversion -> save dense sidecar round trip.
+
+#### C2 - Lazy Per-Callback Score Materialization
+
+5. Do not compute EAMC scores on callbacks that do not evict. In the slot-pool
+   flow, `score()` is only needed while selecting a victim for a miss. Keep
+   that property.
+
+6. On first `score(layer, expert)` after an `observe()` for that callback,
+   lazily compute and cache:
+   - nearest-neighbor rows for the current prefix,
+   - one `score_for_expert[expert]` vector for the requested layer,
+   - metadata counters for rows scanned and materialization cost.
+
+7. Eviction scans then read `score_for_expert[exp]` in O(1):
+
+```text
+score_for_expert[expert] = weighted average over top EAMC neighbors
+```
+
+8. Cache invalidation rules:
+   - `begin_request()` clears current sparse activations and score caches,
+   - `observe(layer, experts)` invalidates only prefix/score caches affected by
+     the new observation,
+   - `end_request()` appends the sparse row and invalidates corpus-dependent
+     caches,
+   - prefill callback waves must not reuse a score vector computed before a
+     later observation changed the request row.
+
+#### C3 - Optional Corpus Row Cap, Hit-Rate Gated
+
+9. Add row caps only after C1/C2 pass:
+   - default uncapped behavior should continue using all loaded corpus rows,
+   - add `LLAMA_MOE_EAMC_ROWS=N` as a diagnostic override,
+   - row selection must use newest ring/FIFO rows, not arbitrary vector order,
+   - nearest-neighbor count remains the sidecar/default value unless a
+     separate diagnostic override is added.
+
+10. A row cap cannot become the default unless it does not hurt hit rate:
+    - compare uncapped EAMC, capped EAMC, and LRU on identical cache/reset
+      settings,
+    - require decode hit rate within 0.5 percentage points of uncapped EAMC,
+    - require prefill hit rate not worse than uncapped EAMC by more than 0.5
+      percentage points,
+    - if capped EAMC is faster but hit rate regresses, keep it diagnostic only.
+
+11. Add profile counters:
+   - `eamc_rows_scored`
+   - `eamc_cosine_us`
+   - `eamc_score_materialize_us`
+   - `eamc_score_cache_hits`
+   - `eamc_score_cache_misses`
+
+### Acceptance
+
+- EAMC online predictor row time is below 10 ms/token on the 8000 MiB,
+  256 prompt, 256 decode benchmark.
+- Uncapped sparse/incremental EAMC hit rates match Phase B uncapped EAMC within
+  0.5 percentage points:
+  - prefill baseline: 81.9%,
+  - decode baseline: 90.3%.
+- TPOT improves materially without increasing misses/token; target decode TPOT
+  is below 100 ms/token before Phase D/E work.
+- New dense-equivalence unit tests pass before row-cap experiments are enabled.
+- Row caps remain diagnostic unless they preserve hit rate under the gates
+  above.
+- EAMC and LRU are compared on identical cache/reset settings after C1/C2. If
+  optimized uncapped EAMC still does not beat LRU on TPOT or hit rate, make LRU
+  the documented performance default and keep EAMC experimental.
+
+## Phase D - Remove Host Synchronization From H2D Buffer Lifetime
+
+Status: implemented and benchmarked on 2026-06-12. The normal miss-completion
+path no longer synchronizes the host on each H2D event before recycling pinned
+memory; pinned buffers are released by polling the H2D end event. This reduced
+decode `stall_us` from about 16.8 ms/token to 0.41 ms/token on the 8000 MiB
+EAMC benchmark. End-to-end TPOT did not improve in that run (57.92 -> 62.13
+ms/token versus the latest root summary) because `ssd_read_us`, callback wall,
+and predictor time rose. Treat Phase D as an overlap/profiler-correctness fix,
+not yet a throughput win. See
+`implementation_plan_mvp_perf_20260611_progress.md` for artifacts and metrics.
+
+Current async H2D is ordered correctly but the host waits for every event
+before recycling pinned memory. Replace this with asynchronous lifetime
+tracking.
+
+### Changes
+
+1. Add an event query helper:
+
+```cpp
+bool io_event_query(void * ev);
+```
+
+2. Keep completed H2D buffers in an `inflight_h2d` list:
+   - pinned buffer pointer,
+   - begin/end events,
+   - destination metadata for diagnostics.
+
+3. Release a pinned buffer only after its H2D end event has completed.
+   Poll completed events at:
+   - start of each callback,
+   - after draining worker completions,
+   - before blocking for a free pinned buffer,
+   - request end.
+
+4. Only block the host when:
+   - no pinned buffers are free,
+   - queue progress is impossible, and
+   - no H2D event has completed.
+
+5. Keep `cudaStreamWaitEvent()` on the compute stream. That is the correctness
+   ordering requirement; host synchronization is only a buffer lifetime issue.
+
+6. Raise or make configurable:
+   - pinned buffer count,
+   - event pool soft cap,
+   - worker queue capacity.
+
+7. Sort miss blobs by file offset before submission. If adjacent blob ranges
+   are contiguous or close, optionally coalesce reads into one pinned buffer
+   and issue multiple H2D copies from slices.
+
+### Acceptance
+
+- `stall_us` falls materially on decode miss rows.
+- H2D effective throughput improves from about 1.5 GiB/s toward the Oculink
+  link budget.
+- `test-cuda-stream` covers async buffer lifetime without immediate
+  `cudaEventSynchronize()`.
+- Golden-logit gates still pass.
+
+## Phase E - Restore Safe CUDA Slot Fast Paths
+
+Status: partially implemented and validated on 2026-06-12. Guarded quantized
+single-token `.slot` MMVQ decode is available with `LLAMA_MOE_SLOT_MMVQ=1` and
+improved TPOT from 62.13 ms/token to 47.20 ms/token on the 8000 MiB EAMC
+benchmark. This did not fully close the decode `compute_us` opportunity because
+CUDA graph capture and top-k/MoE fusion remain disabled for `.slot`.
+
+Once host-side overhead is controlled, attack `compute_us`.
+
+### Changes
+
+1. Add a synthetic `.slot` `MUL_MAT_ID` CUDA test:
+   - random slot tensors,
+   - random slot id tensors,
+   - compare generic sorted path vs specialized path,
+   - cover single-token decode and multi-token prefill shapes.
+
+2. Re-enable specialized MMVQ for `.slot` decode first, behind a guard:
+
+```text
+LLAMA_MOE_SLOT_MMVQ=1
+```
+
+3. If decode passes, test MMQ/MMF and multi-token prefill paths separately.
+
+4. Keep CUDA graph capture disabled for `.slot` until the graph and callback
+   ordering is explicitly proven safe.
+
+5. Treat top-k MoE fusion as a separate later step:
+   - first restore unfused specialized `MUL_MAT_ID`,
+   - then validate GLU/MoE fusion,
+   - only then revisit the disabled top-k fusion.
+
+### Acceptance
+
+- Golden-logit matrix passes with `LLAMA_MOE_SLOT_MMVQ=1`.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- End-to-end speed is the primary gate: prefill TTFT and decode TPOT improve
+  versus the generic sorted path on the same model, sidecar, cache budget, and
+  benchmark settings.
+- Decode `compute_us` drops significantly versus the generic sorted path.
+- Secondary metrics do not regress enough to erase the wall-clock gain:
+  `h2d_us`, `stall_us`, predictor time, SSD read time, callback wall time, hit
+  rate, and misses/token should stay within normal run-to-run noise, with any
+  larger regression explicitly justified by a faster prefill/decode result.
+- The guard can be disabled quickly if a model or shape regresses.
+
+## Phase F - Decode CUDA Graphs For Guarded Slot MMVQ
+
+Known issue link: `docs/moe-offload/known-issues.md`, "Specialized `.slot`
+`MUL_MAT_ID` Paths Are Mostly Bypassed".
+
+Status: implemented and validated on 2026-06-12. `LLAMA_MOE_SLOT_GRAPHS=1`
+now enables CUDA graph capture only for the guarded decode `.slot` MMVQ path
+when `LLAMA_MOE_SLOT_MMVQ=1` is also set. The 8000 MiB EAMC benchmark improved
+TPOT from 47.20 ms/token in Phase E to 30.63 ms/token and decode `compute_us`
+from 24.34 ms/token to 10.46 ms/token. Correctness gates passed with
+`max|d| = 0` and clean `llama-cli` chat smoke. The benchmark was run from the
+static validation build because Windows Smart App Control blocked the rebuilt
+shared `build-moe\bin\Release\ggml-cuda.dll`.
+
+Phase F targeted the correctness-first launch/order overhead remaining after
+Phase E. The guarded MMVQ path removed part of `compute_us`, but CUDA graph
+capture was still disabled for every `.slot` `MUL_MAT_ID`. The implementation
+re-enabled it only for the already-validated decode shape, not for prefill.
+
+### Changes
+
+1. Add a graph-capture compatibility predicate for `.slot` `MUL_MAT_ID`:
+   - require `LLAMA_MOE_SLOT_MMVQ=1`,
+   - require quantized `src0`,
+   - require single-token decode shape,
+   - require MMVQ-supported batch/slot dimensions,
+   - keep generic sorted, MMQ/MMF, and prefill shapes graph-disabled.
+
+2. Prove callback/remap ordering before enabling the graph path:
+   - the eval callback must complete slot-id writes before graph replay,
+   - H2D expert copies must still insert compute-stream waits before use,
+   - graph replay must not capture stale slot-id contents or stale H2D events.
+
+3. Add a focused CUDA test:
+   - build the same synthetic `.slot` MMVQ decode graph used by
+     `test-slot-mmvq`,
+   - run repeated decode replays with changing slot ids and changing slot
+     contents,
+   - compare against CPU/reference output on every replay.
+
+4. Add a guard separate from Phase E if useful:
+
+```text
+LLAMA_MOE_SLOT_GRAPHS=1
+```
+
+5. Keep `llama-cli` default prefill and all multi-token prefill shapes
+   unchanged.
+
+### Acceptance
+
+- Golden-logit matrix passes with `LLAMA_MOE_SLOT_MMVQ=1` and graph guard on.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase E on the same model, sidecar, cache budget,
+  and benchmark settings.
+- Decode `compute_us` drops versus Phase E; if the improvement appears mostly
+  in unattributed wall time instead, document why the profiler bucket does not
+  capture the graph benefit.
+- `h2d_us`, `stall_us`, predictor time, SSD read time, callback wall time, hit
+  rate, and misses/token do not regress enough to erase the decode wall-clock
+  gain.
+- Any graph guard can be disabled independently from `LLAMA_MOE_SLOT_MMVQ`.
+
+## Phase G - Decode GLU Fusion Revalidation
+
+Known issue link: `docs/moe-offload/known-issues.md`, "Specialized `.slot`
+`MUL_MAT_ID` Paths Are Mostly Bypassed".
+
+After the guarded MMVQ decode path and graph capture are correct, revalidate
+the `.slot` GLU/MoE fusion around `MUL_MAT_ID` as a decode-only optimization.
+Do not use this phase to fix batched prefill or top-k MoE fusion.
+
+### Changes
+
+1. Inventory currently disabled CUDA fusion points in `LLAMA_MOE_OFFLOAD`:
+   - GLU/MoE fusion around `MUL_MAT_ID`,
+   - any fused mul-mat-vector path currently excluded for `.slot`.
+
+2. Add an independent GLU fusion guard so it can be isolated:
+
+```text
+LLAMA_MOE_SLOT_GLU_FUSION=1
+```
+
+3. Validate GLU fusion on decode shape:
+   - start from Phase E guarded MMVQ,
+   - run synthetic CUDA tests with changing slot ids and slot contents,
+   - run golden logits with GLU fusion enabled,
+   - run chat smoke with GLU fusion enabled.
+
+4. Keep the default off until a full decode validation matrix passes.
+
+5. If a fusion affects prefill or multi-token shapes, leave that part disabled
+   and move it to the prefill phase.
+
+6. Phase G implementation result:
+   - accepted `LLAMA_MOE_SLOT_GLU_FUSION=1` for quantized `.slot`
+     single-token `MUL_MAT_ID + GLU` decode only,
+   - kept top-k MoE fusion out of scope and moved it to Phase H,
+   - left multi-token/prefill fusion work for Phase I or later.
+
+### Acceptance
+
+- Golden-logit matrix passes for each accepted enabled fusion and for the
+  accepted combined decode-fusion configuration.
+- Any fusion that fails golden logits remains disabled by default and is
+  documented as still open.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase E/F on the same benchmark settings.
+- Decode `compute_us` and/or callback wall time drops materially; if
+  `compute_us` is flat, the plan must explicitly record where the wall-clock
+  benefit appears.
+- Secondary metrics stay within noise or improve: `h2d_us`, `stall_us`,
+  predictor time, SSD read time, hit rate, and misses/token.
+- Any fusion guard can be disabled independently if a model or shape regresses.
+
+## Phase H - CUDA Top-k MoE Fusion Correctness And Decode Revalidation
+
+Known issue link: `docs/moe-offload/known-issues.md`, "CUDA Top-k MoE Fusion Is
+Disabled".
+
+Treat top-k MoE fusion as a separate high-risk correctness issue, not as a
+minor follow-up to GLU fusion. It was historically sufficient to reproduce
+streaming logit drift, and Phase G's attempted single-row decode revalidation
+still failed the golden-logit gate with `max|d| = 4.639292e-01`. Do not enable
+this path for normal `LLAMA_MOE_OFFLOAD` runs until the routing and logit drift
+are explained and fixed.
+
+### Changes
+
+1. Keep top-k MoE fusion hard-disabled for `LLAMA_MOE_OFFLOAD` by default.
+   `LLAMA_MOE_TOPK_FUSION=1` may exist only as an explicit experimental
+   diagnostic once the phase starts; it must not silently affect normal runs.
+
+2. Build a routing-level diagnostic harness before changing the fused kernel:
+   - dump/log unfused router logits, selected ids, and selected weights for a
+     small decode run,
+   - dump/log the same tensors from the fused top-k path,
+   - compare full-residency versus streaming,
+   - compare unfused versus fused with identical slot-table and slot-id inputs,
+   - include tie/NaN/bias/norm/scale cases that the existing CUDA top-k matcher
+     supports.
+
+3. Isolate where drift enters:
+   - top-k ids differ,
+   - top-k weights differ,
+   - ids/weights are correct but downstream slot remap consumes stale or
+     inconsistent routing state,
+   - CUDA graph capture/replay changes the observed tensors,
+   - fusion memory aliasing overwrites inputs or intermediates.
+
+4. Add focused tests before enabling the path:
+   - synthetic CUDA top-k fusion test with stable expected ids/weights,
+   - streaming slot-table remap test with changing selected experts,
+   - golden logits with `LLAMA_MOE_TOPK_FUSION=1` and GLU fusion disabled,
+   - golden logits with top-k + GLU fusion combined only after each passes
+     independently,
+   - chat smoke after top-k passes golden logits.
+
+5. Keep prefill/multi-token top-k fusion out of this phase unless decode is
+   already correct. If decode and prefill share the same matcher, explicitly
+   guard decode-only shapes and leave multi-token shapes disabled.
+
+6. Once correctness passes, measure decode performance against the Phase G GLU
+   baseline:
+   - TPOT,
+   - `topk_d2h_us`,
+   - callback wall time,
+   - `compute_us`,
+   - h2d/stall/predictor/SSD/hit-rate/misses-token secondary metrics.
+
+7. Phase H implementation result:
+   - added an opt-in diagnostic gate, `LLAMA_MOE_TOPK_FUSION_DIAG=1`, while
+     leaving normal `LLAMA_MOE_TOPK_FUSION=1` ineffective for
+     `LLAMA_MOE_OFFLOAD` builds,
+   - constrained the diagnostic fused top-k path to single-token decode
+     shapes,
+   - moved the streaming callback boundary from the selected top-k tensor to
+     the final routing-weights tensor for the diagnostic path, while still
+     reading expert IDs from the original top-k tensor,
+   - fixed callback reads of strided top-k views with
+     `ggml_backend_tensor_get_2d()`,
+   - added `test-topk-moe-fusion` for Qwen-style
+     `softmax -> argsort_top_k -> get_rows -> norm -> scale` routing.
+
+   The strided top-k callback read fix is a default-path fix, independent of
+   diagnostic top-k fusion. It explains the large prefill speedup observed in
+   the Phase H artifacts: Phase G was reading non-contiguous top-k views as if
+   they were compact, inflating apparent expert demand during prefill. In the
+   8000 MiB EAMC run, the average observed experts per prefill callback fell
+   from 64.0 in Phase G to about 20.7 in Phase H baseline, prefill misses fell
+   from 44581 to 11610, prefill SSD read time fell from 16799 ms to 4199 ms,
+   and prefill callback wall time fell from 23467 ms to 6498 ms. This happened
+   with top-k fusion disabled.
+
+   Root cause of the Phase G golden-logit failure was the callback/fusion
+   boundary, not a bad fused top-k ordering result: the streaming eval callback
+   stopped graph execution at `ffn_moe_topk`, but the fused CUDA router needs
+   the graph segment through final routing weights to execute as one unit.
+   Registering final weights as an alternate callback point lets fused routing
+   produce both IDs and weights before the slot loader remaps IDs and stages
+   expert weights.
+
+   Correctness is fixed for the diagnostic decode path:
+
+   - `test-topk-moe-fusion`: passed for single-token decode and multi-token
+     fallback.
+   - Golden logits with top-k fusion alone: passed, `max|d| = 0`.
+   - Golden logits with top-k + GLU fusion: passed, `max|d| = 0`.
+   - Golden logits with top-k + GLU fusion + guarded graphs: passed,
+     `max|d| = 0`.
+   - `llama-cli` chat smoke: passed.
+
+   Same-build 8000 MiB EAMC performance showed the default-path prefill gain,
+   but diagnostic top-k fusion itself did not show a material decode gain:
+
+| Metric | Phase G GLU | Phase H baseline | Phase H top-k diag |
+| --- | ---: | ---: | ---: |
+| TTFT / prefill | 14021.9 ms | 5070.4 ms | 5199.6 ms |
+| Prefill hit rate | 81.9% | 85.4% | 86.0% |
+| Prefill misses | 44581 | 11610 | 11125 |
+| Prefill callback wall | 23467 ms | 6498 ms | 6610 ms |
+| TPOT / decode | 30.67 ms/token | 31.91 ms/token | 31.88 ms/token |
+| Decode hit rate | 89.2% | 88.2% | 88.3% |
+| Decode SSD read | 11.03 ms/token | 11.98 ms/token | 12.44 ms/token |
+| Decode H2D | 9.34 ms/token | 10.29 ms/token | 10.12 ms/token |
+| Decode compute | 10.37 ms/token | 10.48 ms/token | 10.11 ms/token |
+| Decode stall | 0.14 ms/token | 0.15 ms/token | 0.15 ms/token |
+| Decode predictor | 1.31 ms/token | 1.07 ms/token | 1.02 ms/token |
+| Decode callback wall | 17.06 ms/token | 18.07 ms/token | 18.37 ms/token |
+| Decode top-k D2H | 1.57 ms/token | 1.58 ms/token | 1.58 ms/token |
+
+   Conclusion: Phase H accepts the correctness fix and diagnostic harness, but
+   does not promote top-k fusion as a normal performance guard. Keep the
+   strided top-k read fix on by default. Keep top-k fusion decode-only and
+   default-off until a broader run shows consistent TPOT or callback/top-k-D2H
+   improvement.
+
+### Acceptance
+
+- Root cause of the Phase G top-k golden-logit failure is documented.
+- Synthetic top-k ids/weights match the unfused reference for supported decode
+  shapes.
+- Golden logits pass with top-k fusion alone: `max|d| <= 1e-3`.
+- Golden logits pass with top-k fusion plus accepted GLU fusion.
+- Chat smoke remains clean with default `llama-cli` ubatch 1.
+- Decode TPOT improves versus Phase G or the measured reduction is clearly
+  visible in `topk_d2h_us`/callback wall time without hurting end-to-end TPOT.
+- Secondary metrics stay within noise or improve: `h2d_us`, `stall_us`,
+  predictor time, SSD read time, hit rate, and misses/token.
+- Top-k fusion remains independently disableable and default-off until the full
+  validation matrix passes.
+
+Current status: correctness acceptance passed under `LLAMA_MOE_TOPK_FUSION_DIAG=1`;
+performance/default acceptance did not pass because TPOT and `topk_d2h_us` were
+flat and callback wall time did not improve.
+
+## Phase I - Prefill Correctness And Multi-Token Compute Fast Paths
+
+Known issue links:
+
+- `docs/moe-offload/known-issues.md`, "Batched Streaming Chat Prefill Is Not
+  Yet Safe".
+- `docs/moe-offload/known-issues.md`, "Specialized `.slot` `MUL_MAT_ID` Paths
+  Are Mostly Bypassed".
+
+Before tuning prefill cache policy, close or isolate the remaining prefill
+correctness and compute-path blockers. The current Phase H baseline made
+prefill much faster by fixing strided top-k callback reads, but it still uses
+mostly generic sorted `.slot` compute for multi-token prefill. The known
+batched `llama-cli` chat issue also prevents making larger prefill ubatches a
+normal interactive-chat default.
+
+This phase targets both prefill and decode `compute_us`, but its first priority
+is prefill safety. Do not enable a faster multi-token path by default until the
+formatted-chat smoke passes.
+
+### Changes
+
+1. Split the prefill problem into two independent gates:
+   - raw-completion/logit correctness at larger streaming ubatches,
+   - formatted `llama-cli --jinja --reasoning off` chat correctness at the same
+     ubatches.
+
+2. Reproduce and instrument the open batched-chat-prefill issue:
+   - run `LLAMA_MOE_STREAMING_UBATCH=1`, `4`, and `8`,
+   - capture exact prompts and transcripts for the known failures,
+   - compare chat-template prefill batches against raw completion with the same
+     token sequence where possible,
+   - keep `llama-cli` default at ubatch 1 while this gate is open.
+
+3. Audit multi-token prefill compute paths that are still bypassed:
+   - generic sorted `.slot` `MUL_MAT_ID`,
+   - guarded MMVQ/MMQ/MMF candidates for `.slot`,
+   - generic sorted CUDA graph capture,
+   - non-GLU fusion paths,
+   - any path that currently only accepts single-token decode.
+
+4. Add focused synthetic tests before turning on any multi-token path:
+   - multi-token `.slot` `MUL_MAT_ID` with changing slot IDs and slot contents,
+   - quantized MMQ/MMF prefill shapes if supported by tensor type,
+   - graph replay with changing slot IDs for multi-token shapes,
+   - fallback checks showing unsupported shapes still use the safe path.
+
+5. Validate in increasing-risk order:
+   - synthetic CUDA tests,
+   - raw-completion golden logits at `-ub 4`, `-ub 8`, and the auto effective
+     ubatch,
+   - `llama-cli` chat smoke at the same ubatches,
+   - 8000 MiB EAMC benchmark against the Phase H baseline.
+
+6. Measure both prefill and decode compute effects:
+   - prefill TTFT and per-token ms,
+   - prefill `compute_us`, callback wall, top-k D2H, H2D, stall, predictor,
+     SSD, hit rate, misses/token, and required experts/callback,
+   - decode TPOT and the same secondary metrics,
+   - correctness result for each guard combination.
+
+7. Keep each new fast path independently gated, for example:
+
+```text
+LLAMA_MOE_PREFILL_MMVQ=1
+LLAMA_MOE_PREFILL_GRAPHS=1
+LLAMA_MOE_PREFILL_FUSION=1
+```
+
+Only use these names after confirming they match the actual implementation
+boundaries. Reuse existing `LLAMA_MOE_SLOT_MMVQ`, `LLAMA_MOE_SLOT_GRAPHS`, or
+`LLAMA_MOE_SLOT_GLU_FUSION` only if the guard semantics stay clear for both
+decode and prefill.
+
+### Acceptance
+
+- The batched streaming chat-prefill issue is either fixed or documented with a
+  narrower root cause and a hard guard that prevents unsafe default use.
+- Raw-completion golden logits pass at the tested larger ubatches.
+- `llama-cli --jinja --reasoning off` chat smoke passes before any larger
+  interactive-chat prefill ubatch becomes default.
+- Any multi-token `.slot` fast path has a synthetic CUDA test with changing
+  slot IDs and slot contents.
+- Prefill `compute_us` and/or TTFT improves versus the Phase H baseline without
+  regressing decode TPOT.
+- Secondary metrics stay within noise or improve: H2D, stall, predictor, SSD,
+  hit rate, misses/token, and required experts/callback.
+- All new prefill compute guards remain independently disableable.
+
+Status: partially accepted on 2026-06-12. Phase I added guarded multi-token
+`.slot` MMVQ prefill through `LLAMA_MOE_PREFILL_MMVQ=1`, requiring
+`LLAMA_MOE_SLOT_MMVQ=1` as the parent guard. Synthetic CUDA coverage passed for
+multi-token shapes with changing slot IDs and changed slot tensor contents.
+Raw-completion golden logits passed with `max|d|=0`, and formatted
+`llama-cli --jinja --reasoning off` chat smoke passed both at the
+correctness-first default and with forced `LLAMA_MOE_STREAMING_UBATCH=8`.
+
+Default promotion is not accepted. In the 8000 MiB EAMC same-build benchmark,
+the guard improved TTFT from 6505.2 ms to 6202.5 ms, but decode TPOT regressed
+from 36.72 ms/token to 40.85 ms/token and decode callback wall time rose from
+22.40 ms/token to 26.00 ms/token. Keep `LLAMA_MOE_PREFILL_MMVQ=1`
+experimental/default-off; leave `llama-cli --moe-offload` at ubatch 1 until
+the broader Phase K matrix closes the historical chat-prefill issue. Phase K
+later passed that matrix and chat smoke, but the interactive default remains
+conservative because the Phase I prefill MMVQ guard still regressed decode
+TPOT.
+
+## Phase J - Prefill-Specific Improvements
+
+At 8000 MiB the current slot budget forces effective ubatch 8. Prefill gains
+need either more slots or a different prefill strategy.
+
+### Changes
+
+1. Benchmark cache/ubatch matrix after Phases B-D:
+
+| Cache MiB | Expected slots | Expected effective ubatch |
+| ---: | ---: | ---: |
+| 8000 | 96 | 8 |
+| 12000 | about 145 | 16 |
+| 14000 | measure | 16 or 32 |
+| 16000 | measure | 32 or higher if memory allows |
+
+2. Add cold/warm prefill reporting:
+   - first prefill after empty slot cache,
+   - subsequent prefill with warm cache,
+   - optional reset between repeats.
+
+3. Add optional hot-start expert loading:
+   - load top experts per layer from an offline profile or EAMC sidecar,
+   - fill only available slot budget,
+   - measure TTFT impact separately from decode.
+
+4. Investigate router-aware internal prefill splitting:
+   - accept a larger prompt ubatch,
+   - split one MoE layer's selected tokens/experts into chunks whose unique
+     expert count fits `n_slots`,
+   - avoid changing the user-visible ubatch or context API.
+
+5. Do not change `llama-cli` default prefill above 1 until the known batched
+   chat-logit issue is closed.
+
+### Acceptance
+
+- Benchmark docs show which cache budget is needed for effective ubatch 16+
+  on the 16 GiB target GPU.
+- Cold and warm TTFT are reported separately.
+- Any hot-start feature improves cold TTFT without hurting decode correctness.
+- Batched prefill changes pass golden logits and chat smoke before becoming
+  defaults.
+
+Status: accepted as calibration/reporting on 2026-06-12. `llama-moe-bench`
+now reports `TTFT cold` and `TTFT warm` separately, includes prefill I/O and
+profiler breakdowns, supports `--moe-reset-cache-between-repeats` and
+`--moe-warm-cache`, and adds benchmark-only `--moe-hot-start` EAMC-sidecar
+preloading.
+
+The cache matrix on the 16 GiB dev box showed:
+
+| Cache MiB | Slots | Effective ubatch | TTFT cold | TPOT | VRAM peak |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8000 | 96 | 8 | 5802.0 ms | 30.89 ms/token | 10.15 / 15.92 GB |
+| 12000 | 145 | 16 | 4204.1 ms | 25.92 ms/token | 14.08 / 15.92 GB |
+| 14000 | 169 | 16 | 4148.9 ms | 24.73 ms/token | 15.72 / 15.92 GB |
+| 16000 | 193 | 16 | 5141.3 ms | 77.68 ms/token | 15.92 / 15.92 GB |
+
+Recommendation: use 12000 MiB as the practical 16 GiB target for effective
+ubatch 16. Treat 14000 MiB as local tuning only, and avoid 16000 MiB on this
+GPU because it over-pressures VRAM and regresses decode `compute_us`.
+
+`--moe-hot-start` is implemented but not accepted as a default. The smoke run
+preloaded 3840 slots across 40 layers, but TTFT worsened versus the warm-cache
+smoke. Router-aware internal prefill splitting remains deferred: it is a
+larger graph/runtime change, while the Phase J matrix identifies a lower-risk
+cache-budget route to prefill improvement.
+
+## Phase K - Validation Matrix
+
+Run after each performance phase, not only at the end.
+
+### Correctness
+
+```powershell
+ctest --test-dir build-moe -C Release -L moe-offload --output-on-failure
+```
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8
+```
+
+Also rerun the existing ubatch matrix:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-streaming-ubatch-matrix.ps1 `
+  -StreamCacheMb 4000,8000,12000 `
+  -UBatch 8,16,32,64
+```
+
+Chat smoke:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -CacheMb 8000 -Predictor lru -NPredict 96
+```
+
+### Performance
+
+Run LRU and EAMC online deferred-save with identical settings. The commands
+below use
+`llama-moe-bench` because it is the most controlled MoE-specific benchmark
+surface; the same profiler fields and diagnosis apply to `llama-bench` runs
+that emit `moe-profile.csv`.
+
+```powershell
+.\build-moe\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor lru `
+  --moe-profile-csv tests\moe-offload\_out\perf-lru-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\perf-lru-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+```powershell
+.\build-moe\bin\Release\llama-moe-bench.exe `
+  --model C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.moe.gguf `
+  --pp 256 --tg 256 --repeat 3 `
+  --moe-cache-vram-mb 8000 `
+  --moe-predictor eamc `
+  --moe-eamc-path C:/AI/models/qwen/Qwen3.5-35B-A3B-Q4_K_M.eamc `
+  --moe-profile-csv tests\moe-offload\_out\perf-eamc-online-8gb.csv `
+  --moe-profile-summary tests\moe-offload\_out\perf-eamc-online-8gb.summary.txt `
+  -ngl 99 -c 4096 -ub 512
+```
+
+Repeat for `--moe-cache-vram-mb 12000` and `-ub 16`/`-ub 32`.
+
+### Metrics to Compare
+
+- TTFT cold
+- TTFT warm
+- TPOT
+- decode hit rate
+- prefill hit rate
+- SSD bytes/token
+- H2D ms/token
+- stall ms/token
+- compute ms/token
+- predictor observe/score/end/save ms/token
+- sidecar bytes written
+- unattributed wall time
+- peak VRAM
+
+Status: closed on 2026-06-12 using the static CUDA validation build.
+
+Validation evidence:
+
+- Build: `cmake --build build-moe-static --config Release --target
+  test-slot-mmvq test-topk-moe-fusion llama-completion llama-cli
+  llama-moe-bench -j 8` passed, followed by the missing registered test
+  targets.
+- CTest: `ctest --test-dir build-moe-static -C Release -L moe-offload
+  --output-on-failure` passed 8/8 tests.
+- Golden logits: accepted guard stack passed cache 4000 MiB, `-ub 8`,
+  `-n 8`, `max|d|=0`.
+- Ubatch matrix: cache 4000, 8000, and 12000 MiB crossed with ubatch 8, 16,
+  32, and 64 all passed with `max|d|=0`. Artifact:
+  `tests/moe-offload/_out/phase-k-ubatch-matrix/summary.csv`.
+- Chat smoke: `llama-cli --jinja --reasoning off` passed at the default ubatch
+  and forced `LLAMA_MOE_STREAMING_UBATCH=8`.
+- Final benchmark: 12000 MiB EAMC, `--pp 256`, `--tg 128`, `--repeat 3`,
+  `--moe-reset-cache-between-repeats`, accepted guard stack. Artifact:
+  `tests/moe-offload/_out/phase-k-final-12000.summary.txt`.
+
+Final benchmark summary:
+
+| Metric | Value |
+| --- | ---: |
+| Effective ubatch | 16 |
+| Slots | 145 / 256 |
+| TTFT cold | 4398.2 ms |
+| TPOT | 26.78 ms/token |
+| Prefill hit rate | 75.6% |
+| Decode hit rate | 92.4% |
+| Prefill `gpu_compute` | 7.49 ms/token |
+| Decode `gpu_compute` | 11.16 ms/token |
+| Prefill H2D | 4.91 ms/token |
+| Decode H2D | 6.64 ms/token |
+| Prefill stall | 0.10 ms/token |
+| Decode stall | 0.11 ms/token |
+| Prefill predictor | 0.35 ms/token |
+| Decode predictor | 0.62 ms/token |
+| Peak VRAM | 14.08 / 15.92 GB |
+
+The entire MVP perf plan is closed. Remaining work is post-closeout:
+router-aware internal prefill splitting, default promotion of guarded fast paths,
+normal top-k fusion promotion, prefill graph/fusion work, and broader
+interactive-chat prompt coverage.
+
+## Recommended Order
+
+1. Phase A: add missing profiler buckets.
+2. Phase B: keep EAMC online in memory and remove per-token sidecar save.
+3. Run an LRU baseline immediately after Phase B.
+4. Phase C: optimize EAMC scoring only if EAMC still looks useful versus LRU.
+5. Phase D: fix H2D buffer lifetime to recover overlap.
+6. Phase E: re-enable CUDA `.slot` fast paths one at a time.
+7. Phase F: re-enable CUDA graph capture for guarded `.slot` MMVQ decode only.
+8. Phase G: revalidate decode GLU fusion.
+9. Phase H: treat top-k MoE fusion as a dedicated correctness and decode
+   performance issue.
+10. Phase I: close prefill correctness and multi-token compute fast-path
+    blockers.
+11. Phase J: tune prefill using cache budget, cold/warm reporting, and optional
+    hot-start.
+12. Phase K: closeout validation matrix.
+
+The expected biggest immediate win was Phase B. The plan has now completed
+through Phase K with the final accepted defaults and remaining items documented
+as post-closeout work.
