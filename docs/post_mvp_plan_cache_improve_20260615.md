@@ -101,7 +101,6 @@ The first way to increase prefill and decode speed is to add expert prefetch, so
 #### Reference papaers  
 /docs/papers/5-star/MoE Infinity.pdf  
 /docs/papers/5-star/FineMoE.pdf  
-/docs/papers/5-star/ADEPT.pdf  
 
 #### Questions  
 Why are the EAMC results worse than LRU results from the MVP? The MVP was based on the MoE-Infinity paper, is the EAMC implementation correct?  

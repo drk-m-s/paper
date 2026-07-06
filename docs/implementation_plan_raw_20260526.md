@@ -24,11 +24,12 @@ A profiling code needs to be established alongside the implementation, it needs 
 
 ## Second implementation area to explore:
 Main "MoE Infinity" first implementation architecture but improve the following areas:
-- Use GPU VRAM + CPU DRAM + SSD together. Add a new expert cache pool in CPU DRAM to speed up inference, because reading from SSD is much slower than reading from DRAM. Make the CPU DRAM option a new parameter as well to specify how much CPU DRAM should be used.
-- Thoroughly understand the paper "FineMoE". Incorporate granularity, prefetch policy, eviction policy, etc, which has stronger results compared with MoE-infinity.
+- Thoroughly understand the paper "FineMoE". Incorporate granularity, prefetch policy, eviction policy, etc, which has stronger results compared with MoE-infinity. Especially add Expert Prefetch mechanisms.
 - Thoroughly understand the paper "ADEPT" and Incoporate improvements made in "ADEPT".
+- If expert miss per layer is only 1, for example for one token one layers, 7 out of 8 experts are in the cache while only 1 expert is missed, find the best approximate expert in hot cache instead of fetching it from SSD. Make this an option, allowing to miss 1 or 2 or 3 experts.
 
 Additionally:
+- Use GPU VRAM + CPU DRAM + SSD together. Add a new expert cache pool in CPU DRAM to speed up inference, because reading from SSD is much slower than reading from DRAM. Make the CPU DRAM option a new parameter as well to specify how much CPU DRAM should be used.
 - Add an offline profiling phase such as in "Fiddler" or "DALI" or "PowerInfer" to identify hot experts to be loaded at initiation. 
 
 
