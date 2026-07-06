@@ -6,15 +6,16 @@ Implementation repo: `C:\code\llama.cpp.offload`.
 
 ## Scope
 
-This progress entry covers Phase 0 through Phase 2 implementation and
+This progress entry covers Phase 0 through Phase 3 implementation and
 validation:
 
 - Phase 0 diagnostics and offline CSV analysis.
 - Phase 1 EAMC fidelity audit and request-level `eamc-r` support.
 - Phase 2 eviction-only predictor experiments.
+- Phase 3 guarded MoE-Infinity-style expert prefetch.
 
-It does not implement true expert prefetch, FineMoE ExpertMaps, or CPU DRAM
-tiering.
+It does not implement FineMoE ExpertMaps, semantic early-layer search, dynamic
+FineMoE prefetch, or CPU DRAM tiering.
 
 ## Code Changes
 
@@ -187,20 +188,103 @@ Extended tests:
 - Verifies `eamc-lfu` loads `EAM1` sidecars.
 - Verifies `eamc-lfu` multiplies equal EAMC predictions by visit frequency.
 
+### Phase 3 True Prefetch
+
+Added guarded prefetch options:
+
+```text
+--moe-prefetch off|next-layer|eamc
+--moe-prefetch-distance N
+--moe-prefetch-max-per-layer N
+```
+
+Defaults remain conservative:
+
+```text
+--moe-prefetch off
+--moe-prefetch-distance 1
+--moe-prefetch-max-per-layer 0
+```
+
+Runtime wiring was added through `llama_model_params`, common CLI params,
+`llama-moe-bench`, and `llama-bench`.
+
+Implemented ranked predictor candidates:
+
+- `predictor::rank(layer, max_count)` now returns scored expert candidates.
+- `lru`, `lfu`, `eamc`, `eamc-r`, and `eamc-lfu` expose ranked candidates
+  using their existing keep-score functions.
+- Phase 3 uses `eamc-r` as the measured base predictor.
+
+Implemented the prefetch runtime in `src/moe-offload/slot_pool.cpp`:
+
+- Per-layer loading state tracks speculative slots separately from ready
+  resident slots.
+- Prefetch submissions reserve a loading slot but do not expose
+  `exp2slot`/`slot_to_expert` mappings until all expert blobs finish H2D.
+- Demand loads skip loading slots.
+- Current callback experts remain protected from eviction.
+- Demand I/O has priority over speculative I/O through a demand-first worker
+  queue.
+- Prefetch is bounded by `--moe-prefetch-max-per-layer`, active pinned buffers,
+  queue capacity, and a per-layer loading reserve that keeps at least
+  `n_expert_used` non-loading slots available.
+- Decode prefetch is enabled first; prefill drains any outstanding prefetch
+  before residency checks to avoid shrinking prefill slot capacity.
+- If a future layer reaches an expert while it is still loading, the callback
+  waits for that prefetch and records a not-ready wait instead of submitting a
+  duplicate demand load.
+- Ready prefetched experts are counted once when first consumed.
+- Prefetched experts evicted before use are counted as wasted.
+
+Implemented two prefetch modes:
+
+- `next-layer`: diagnostic mode that tries to prefetch the current layer's
+  observed experts into the next layer, using free slots only.
+- `eamc`: ranked future-layer candidates from the active predictor for
+  layers `l+1..l+d`; it can replace low-score resident experts only when the
+  candidate score is higher than the victim score.
+
+Extended profiler rows, summaries, and the offline analyzer with:
+
+- `prefetch_submitted`
+- `prefetch_ready_hit`
+- `prefetch_not_ready`
+- `prefetch_cancelled`
+- `prefetch_wasted`
+- `prefetch_bytes`
+- `prefetch_wait_us`
+- `prefetch_overlap_us`
+- `demand_miss_after_prefetch`
+
+The local model validation scripts were also extended with optional prefetch
+arguments so golden-logit and chat-smoke gates can exercise the new path.
+
 ## Files Changed In `llama.cpp.offload`
 
-- `src/moe-offload/predictor.h`
-- `src/moe-offload/predictor.cpp`
-- `src/moe-offload/loader.cpp`
-- `src/moe-offload/profiler.h`
-- `src/moe-offload/profiler.cpp`
-- `src/moe-offload/slot_pool.cpp`
 - `common/arg.cpp`
-- `tools/moe-bench/main.cpp`
+- `common/common.cpp`
+- `common/common.h`
+- `include/llama.h`
+- `src/llama-model.cpp`
+- `src/moe-offload/io.cpp`
+- `src/moe-offload/io.h`
+- `src/moe-offload/loader.cpp`
+- `src/moe-offload/predictor.cpp`
+- `src/moe-offload/predictor.h`
+- `src/moe-offload/profiler.cpp`
+- `src/moe-offload/profiler.h`
+- `src/moe-offload/runtime.h`
+- `src/moe-offload/slot_pool.cpp`
 - `tools/llama-bench/llama-bench.cpp`
-- `tests/moe-offload/test-eamc-cosine.cpp`
+- `tools/moe-bench/main.cpp`
 - `tests/moe-offload/analyze-profile.py`
-- `tests/.gitignore`
+
+Local model validation scripts were extended on disk with optional prefetch
+arguments, but they are not tracked by this repository:
+
+- `tests/moe-offload/test-golden-logits.ps1`
+- `tests/moe-offload/test-llama-cli-chat.ps1`
 
 ## Validation
 
@@ -327,6 +411,77 @@ python tests\moe-offload\analyze-profile.py `
   12000-eamc-r=tests\moe-offload\_out\post-cache-p2-20260615-12000-eamc-r-cold-reset.csv `
   12000-eamc-lfu=tests\moe-offload\_out\post-cache-p2-20260615-12000-eamc-lfu-cold-reset.csv `
   > tests\moe-offload\_out\post-cache-p2-20260615-analysis.md
+```
+
+Passed.
+
+Phase 3 focused build:
+
+```powershell
+cmake --build build-moe-static --config Release --target `
+  test-eamc-cosine test-lru-eviction `
+  llama-moe-bench llama-bench llama-cli llama-completion -j 8
+```
+
+Passed. Existing MSVC warnings were unchanged:
+
+- `LNK4098` static CRT conflict on benchmark/CLI targets.
+- `C4804` on the completion target.
+
+Phase 3 focused tests:
+
+```powershell
+.\build-moe-static\bin\Release\test-eamc-cosine.exe
+.\build-moe-static\bin\Release\test-lru-eviction.exe
+python -m py_compile tests\moe-offload\analyze-profile.py
+ctest --test-dir build-moe-static -C Release -L moe-offload --output-on-failure
+```
+
+Passed:
+
+- `test-eamc-cosine.exe`
+- `test-lru-eviction.exe`
+- analyzer Python syntax check
+- full `moe-offload` CTest label: `8/8` tests
+
+Phase 3 CLI help smoke:
+
+```powershell
+.\build-moe-static\bin\Release\llama-bench.exe --help |
+  Select-String -Pattern "moe-prefetch"
+
+.\build-moe-static\bin\Release\llama-moe-bench.exe --help
+```
+
+The help output includes the new prefetch flags. `llama-moe-bench --help`
+continues to return exit code `1` by existing behavior after printing usage.
+
+Phase 3 golden-logit gate with prefetch enabled:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-golden-logits.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-completion.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -Tol 1e-3 -NPredict 8 -StreamCacheMb 4000 `
+  -Prompt "Hello" -Seed 42 -Context 4096 -UBatch 8 `
+  -Prefetch eamc -PrefetchDistance 1 -PrefetchMaxPerLayer 8
+```
+
+Passed:
+
+- `max|d| = 0.000000e+00`
+
+Phase 3 chat smoke with fast paths, `eamc-r`, and prefetch enabled:
+
+```powershell
+$env:LLAMA_MOE_FAST_PATHS='1'
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\moe-offload\test-llama-cli-chat.ps1 `
+  -Bin "$PWD\build-moe-static\bin\Release\llama-cli.exe" `
+  -Model "C:\AI\models\qwen\Qwen3.5-35B-A3B-Q4_K_M.moe.gguf" `
+  -CacheMb 12000 -Predictor eamc-r `
+  -EamcPath tests\moe-offload\_out\post-cache-p3-20260615-chat.eamc `
+  -NPredict 64 -StreamingUBatch 0 `
+  -Prefetch eamc -PrefetchDistance 1 -PrefetchMaxPerLayer 8
 ```
 
 Passed.
@@ -506,6 +661,98 @@ The Phase 2 conclusion is therefore:
 4. Keep `eamc-lfu` opt-in, but do not build Phase 3 prefetch around it unless a
    later corpus shows it beating `eamc-r`.
 
+## Phase 3 Benchmark Matrix
+
+The Phase 3 benchmark compared the best Phase 2 predictor, `eamc-r`, with and
+without guarded prefetch:
+
+```powershell
+$env:LLAMA_MOE_SLOT_MMVQ='1'
+$env:LLAMA_MOE_PREFILL_MMVQ='0'
+$env:LLAMA_MOE_SLOT_GRAPHS='1'
+$env:LLAMA_MOE_SLOT_GLU_FUSION='1'
+$env:LLAMA_MOE_TOPK_FUSION_DIAG='0'
+```
+
+The 8000 MiB runs used:
+
+```text
+--pp 256 --tg 256 --repeat 3 --moe-reset-cache-between-repeats -ub 8
+```
+
+The 12000 MiB runs used:
+
+```text
+--pp 256 --tg 128 --repeat 3 --moe-reset-cache-between-repeats -ub 16
+```
+
+Prefetch runs used:
+
+```text
+--moe-prefetch eamc --moe-prefetch-distance 1 --moe-prefetch-max-per-layer 8
+```
+
+Artifacts:
+
+- `tests/moe-offload/_out/post-cache-p3-20260615-8000-eamc-r-off-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p3-20260615-8000-eamc-r-prefetch-eamc-d1-m8-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p3-20260615-12000-eamc-r-off-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p3-20260615-12000-eamc-r-prefetch-eamc-d1-m8-cold-reset.*`
+- `tests/moe-offload/_out/post-cache-p3-20260615-analysis-8000.md`
+- `tests/moe-offload/_out/post-cache-p3-20260615-analysis-12000.md`
+
+The analyzer reports were regenerated without manual `--tokens` overrides so
+per-token prefetch metrics use the real repeated-token counts from the CSV.
+
+### Matrix Results
+
+| Cache | Prefetch | Prefill ms/tok | Decode TPOT | Prefill hit | Decode hit | Decode SSD GB | Decode SSD ms/tok | Decode H2D ms/tok | Decode predictor | Prefetch MiB/tok | Ready/tok | Wait/tok | Wasted/tok |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8000 MiB | off | 31.25 | 41.56 | 81.0% | 92.1% | 34.54 | 17.64 | 7.00 | 0.25 ms/tok | 0.00 | 0.00 | 0.00 | 0.00 |
+| 8000 MiB | eamc d1 m8 | 20.25 | 25.72 | 81.0% | 92.4% | 33.24 | 7.63 | 6.63 | 0.33 ms/tok | 2.17 | 1.19 | 0.01 | 0.00 |
+| 12000 MiB | off | 16.19 | 23.74 | 75.6% | 93.8% | 13.55 | 6.47 | 5.42 | 0.08 ms/tok | 0.00 | 0.00 | 0.00 | 0.00 |
+| 12000 MiB | eamc d1 m8 | 15.94 | 23.53 | 75.6% | 94.3% | 12.43 | 5.79 | 4.96 | 0.27 ms/tok | 2.97 | 1.63 | 0.01 | 0.00 |
+
+### Interpretation
+
+Phase 3 acceptance is met for the tight 8000 MiB cache case.
+
+At 8000 MiB:
+
+- Prefetch improved decode TPOT from `41.56 ms/token` to `25.72 ms/token`,
+  a `38.1%` improvement versus the same `eamc-r` predictor without prefetch.
+- Decode hit rate improved from `92.1%` to `92.4%`.
+- Decode SSD reads fell from `34.54 GB` to `33.24 GB`.
+- Decode SSD read time fell from `17.64 ms/token` to `7.63 ms/token`, showing
+  useful overlap rather than only fewer misses.
+- Prefetch submitted `1.20` experts/token and produced `1.19` ready hits/token.
+- Not-ready waits were low at `0.01` waits/token and `0.02 ms/token`.
+- Wasted prefetched experts were `0.00`/token in the measured run.
+
+At 12000 MiB:
+
+- Prefetch improved decode TPOT slightly, from `23.74 ms/token` to
+  `23.53 ms/token`.
+- Decode hit rate improved from `93.8%` to `94.3%`.
+- Decode SSD reads fell from `13.55 GB` to `12.43 GB`.
+- Decode SSD read time and H2D time both improved, but the larger cache already
+  had less miss pressure, so overlap translated into a smaller wall-time win.
+- Prefetch submitted `1.64` experts/token, produced `1.63` ready hits/token,
+  and had `0.00` wasted experts/token.
+
+The Phase 3 conclusion is therefore:
+
+1. Keep `--moe-prefetch off` as the default because the feature is new and the
+   measured matrix is still narrow.
+2. Treat `--moe-predictor eamc-r --moe-prefetch eamc --moe-prefetch-distance 1
+   --moe-prefetch-max-per-layer 8` as the first validated experimental
+   prefetch configuration.
+3. The 8000 MiB result clears the required 10% decode TPOT improvement gate.
+4. The 12000 MiB result clears the SSD/H2D reduction gate but needs broader
+   prompts before any recommendation beyond diagnostic use.
+5. Demand-first I/O priority, non-exposed loading slots, and current-callback
+   eviction protection are now implemented safety requirements.
+
 ## Current Phase 0 Status
 
 Implemented:
@@ -552,9 +799,35 @@ Implemented:
 
 Phase 2 is complete.
 
+## Current Phase 3 Status
+
+Implemented:
+
+- guarded prefetch CLI/API options with conservative defaults,
+- predictor ranking API for future-layer candidates,
+- demand-first I/O queue scheduling,
+- per-layer loading slot state separate from ready residency,
+- prefetch reservation, completion, cancellation, not-ready wait handling, and
+  wasted-prefetch accounting,
+- `next-layer` diagnostic prefetch mode,
+- `eamc` predictor-ranked prefetch mode,
+- profiler and analyzer support for prefetch metrics,
+- benchmark/help wiring in `llama-moe-bench` and `llama-bench`,
+- golden-logit validation with prefetch enabled,
+- chat-smoke validation with fast paths and prefetch enabled,
+- required same-build 8000 MiB and 12000 MiB prefetch comparison matrix.
+
+Phase 3 is complete.
+
 ## Next Step
 
-Proceed to Phase 3 true prefetch. Use `eamc-r` as the first prefetch base
-because it is the only Phase 2 predictor that clearly beat LRU on decode hit
-rate, TPOT, and SSD bytes at both tested cache sizes. Keep `lru` as the default
-fallback and keep `lfu` / `eamc-lfu` as experimental comparator policies.
+Proceed to Phase 4 better hot-start. Keep `lru` as the default fallback, keep
+`--moe-prefetch off` as the default, and use the validated experimental Phase 3
+configuration only when explicitly requested:
+
+```text
+--moe-predictor eamc-r --moe-prefetch eamc --moe-prefetch-distance 1 --moe-prefetch-max-per-layer 8
+```
+
+Phase 4 should use the new prefetch metrics to separate useful hot-start loads
+from experts that are loaded speculatively and evicted before use.
